@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>My 釣りポイント帳</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,'Hiragino Sans','Helvetica Neue',Arial,sans-serif;background:#061a2e;color:#d0e8f5;font-size:14px;min-height:100vh}
+input,select,textarea,button{font-family:inherit}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+const AREA_LABEL = { numazu:"沼津", nishiizu:"西伊豆", higashiizu:"東伊豆", minamiizu:"南伊豆", nakaizu:"中伊豆", kanagawa:"神奈川", other:"その他" };
+const TYPE_LABEL = { harbor:"漁港・堤防", beach:"砂浜・サーフ", iso:"磯", pier:"桟橋・護岸", tetra:"テトラ帯" };
+const STATUS_LABEL = { ok:"釣り可", ng:"禁止・NG", tbc:"要確認" };
+const STATUS_COLOR = { ok:"#2ecc87", ng:"#e84c3d", tbc:"#f5a623" };
+const STATUS_BG    = { ok:"rgba(46,204,135,0.15)", ng:"rgba(232,76,61,0.15)", tbc:"rgba(245,166,35,0.15)" };
+const LS_KEY = "fishing_spots_v4";
+
+function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
+function stars(n){ return "★".repeat(n)+"☆".repeat(5-n); }
+
+const EMPTY = {
+  name:"", area:"", type:"", status:"tbc", star:0,
+  addr:"", lat:"", lng:"", fish:"", note:"",
+  date: new Date().toISOString().slice(0,10),
+  parking:false, toilet:false, paid:false, night:false, beginner:false, crowded:false,
+};
+
+function appleUrl(s){
+  if(s.lat&&s.lng) return `maps://maps.apple.com/?ll=${s.lat},${s.lng}&q=${encodeURIComponent(s.name)}`;
+  if(s.addr) return `maps://maps.apple.com/?q=${encodeURIComponent(s.addr)}`;
+  return null;
+}
+function googleUrl(s){
+  if(s.lat&&s.lng) return `https://www.google.com/maps/search/?api=1&query=${s.lat},${s.lng}`;
+  if(s.addr) return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(s.addr)}`;
+  return null;
+}
+
+const inp = {
+  width:"100%", background:"rgba(255,255,255,0.07)", border:"1px solid rgba(255,255,255,0.12)",
+  borderRadius:9, padding:"10px 12px", color:"#d0e8f5", fontSize:14, outline:"none", WebkitAppearance:"none",
+};
+
+function Field({label,children}){
+  return (
+    <div style={{marginBottom:13}}>
+      <div style={{fontSize:11,color:"#6a9bb8",fontWeight:600,letterSpacing:"0.05em",textTransform:"uppercase",marginBottom:5}}>{label}</div>
+      {children}
+    </div>
+  );
+}
+function Input(props){ return <input style={inp} {...props}/>; }
+function Sel({children,...p}){ return <select style={inp} {...p}>{children}</select>; }
+function Textarea(props){ return <textarea style={{...inp,resize:"vertical",minHeight:80,lineHeight:1.6}} {...props}/>; }
+
+function StarPicker({value,onChange}){
+  return (
+    <div style={{display:"flex",gap:4}}>
+      {[1,2,3,4,5].map(n=>(
+        <button key={n} onClick={()=>onChange(n===value?0:n)}
+          style={{fontSize:24,background:"none",border:"none",cursor:"pointer",padding:2,lineHeight:1,color:"#f5a623"}}>
+          {n<=value?"★":"☆"}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function CheckItem({label,checked,onChange}){
+  return (
+    <label style={{display:"flex",alignItems:"center",gap:5,fontSize:12,color:"#d0e8f5",
+      background:"rgba(255,255,255,0.05)",padding:"5px 9px",borderRadius:8,
+      border:"1px solid rgba(255,255,255,0.1)",cursor:"pointer"}}>
+      <input type="checkbox" checked={checked} onChange={e=>onChange(e.target.checked)}
+        style={{accentColor:"#f5a623",width:14,height:14}}/>
+      {label}
+    </label>
+  );
+}
+
+function Modal({show,onClose,children}){
+  if(!show) return null;
+  return (
+    <div onClick={e=>{if(e.target===e.currentTarget)onClose();}}
+      style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.72)",zIndex:300,
+        display:"flex",alignItems:"flex-end",justifyContent:"center"}}>
+      <div style={{background:"#0d2d47",border:"1px solid rgba(255,255,255,0.1)",
+        borderRadius:"20px 20px 0 0",padding:"20px 18px 40px",width:"100%",
+        maxWidth:520,maxHeight:"92vh",overflowY:"auto"}}>
+        <div style={{width:40,height:4,background:"rgba(255,255,255,0.2)",borderRadius:2,margin:"0 auto 18px"}}/>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function EditModal({show,onClose,onSave,initial}){
+  const [form,setForm]=useState(EMPTY);
+  const [gpsLoading,setGpsLoading]=useState(false);
+  useEffect(()=>{if(show)setForm(initial||EMPTY);},[show,initial]);
+  const set=(k,v)=>setForm(f=>({...f,[k]:v}));
+
+  const handleGPS=()=>{
+    if(!navigator.geolocation){alert("GPSに対応していません");return;}
+    setGpsLoading(true);
+    navigator.geolocation.getCurrentPosition(
+      pos=>{
+        set("lat",pos.coords.latitude.toFixed(6));
+        set("lng",pos.coords.longitude.toFixed(6));
+        setGpsLoading(false);
+      },
+      ()=>{alert("現在地の取得に失敗しました");setGpsLoading(false);},
+      {enableHighAccuracy:true,timeout:10000}
+    );
+  };
+
+  const handleSave=()=>{
+    if(!form.name.trim()){alert("ポイント名を入力してください");return;}
+    onSave(form);
+  };
+
+  return (
+    <Modal show={show} onClose={onClose}>
+      <h2 style={{fontSize:16,fontWeight:700,color:"#fff",marginBottom:16}}>
+        {initial?.id?"✏️ ポイントを編集":"🎣 ポイントを追加"}
+      </h2>
+      <Field label="ポイント名 *">
+        <Input placeholder="例：田子漁港（北波止）" value={form.name} onChange={e=>set("name",e.target.value)}/>
+      </Field>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+        <Field label="エリア">
+          <Sel value={form.area} onChange={e=>set("area",e.target.value)}>
+            <option value="">未設定</option>
+            {Object.entries(AREA_LABEL).map(([v,l])=><option key={v} value={v}>{l}</option>)}
+          </Sel>
+        </Field>
+        <Field label="種別">
+          <Sel value={form.type} onChange={e=>set("type",e.target.value)}>
+            <option value="">未設定</option>
+            {Object.entries(TYPE_LABEL).map(([v,l])=><option key={v} value={v}>{l}</option>)}
+          </Sel>
+        </Field>
+      </div>
+      <Field label="釣り可否">
+        <Sel value={form.status} onChange={e=>set("status",e.target.value)}>
+          <option value="tbc">🔍 要確認</option>
+          <option value="ok">✅ 釣り可（確認済み）</option>
+          <option value="ng">❌ 禁止・NG</option>
+        </Sel>
+      </Field>
+      <Field label="📍 住所・場所">
+        <div style={{position:"relative"}}>
+          <Input placeholder="例：静岡県賀茂郡西伊豆町田子" value={form.addr}
+            onChange={e=>set("addr",e.target.value)} style={{...inp,paddingRight:100}}/>
+          <button onClick={handleGPS} disabled={gpsLoading}
+            style={{position:"absolute",right:8,top:"50%",transform:"translateY(-50%)",
+              background:"rgba(245,166,35,0.2)",border:"1px solid rgba(245,166,35,0.4)",
+              color:"#f5a623",borderRadius:6,padding:"4px 8px",fontSize:11,cursor:"pointer",whiteSpace:"nowrap"}}>
+            {gpsLoading?"取得中…":"📡 現在地"}
+          </button>
+        </div>
+        <div style={{fontSize:11,color:"#6a9bb8",marginTop:5,lineHeight:1.6,
+          padding:"7px 10px",background:"rgba(255,255,255,0.04)",borderRadius:7,border:"1px solid rgba(255,255,255,0.08)"}}>
+          住所入力 または「📡 現在地」で緯度経度を自動記録。カードの地図ボタンで開けます。
+        </div>
+      </Field>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+        <Field label="緯度"><Input type="number" step="any" placeholder="35.1234" value={form.lat} onChange={e=>set("lat",e.target.value)}/></Field>
+        <Field label="経度"><Input type="number" step="any" placeholder="138.9876" value={form.lng} onChange={e=>set("lng",e.target.value)}/></Field>
+      </div>
+      <Field label="評価"><StarPicker value={form.star} onChange={v=>set("star",v)}/></Field>
+      <Field label="設備・特徴">
+        <div style={{display:"flex",flexWrap:"wrap",gap:8,marginTop:4}}>
+          {[["parking","🅿 駐車場"],["toilet","🚻 トイレ"],["paid","💰 有料"],
+            ["night","🌙 夜釣り可"],["beginner","🐟 初心者向け"],["crowded","👥 混雑注意"]].map(([k,l])=>(
+            <CheckItem key={k} label={l} checked={form[k]} onChange={v=>set(k,v)}/>
+          ))}
+        </div>
+      </Field>
+      <Field label="狙える魚（カンマ区切り）">
+        <Input placeholder="アジ、シロギス、メジナ" value={form.fish} onChange={e=>set("fish",e.target.value)}/>
+      </Field>
+      <Field label="メモ・偵察記録">
+        <Textarea placeholder="駐車の様子、看板の位置、人の多さ、気になった点など…" value={form.note} onChange={e=>set("note",e.target.value)}/>
+      </Field>
+      <Field label="偵察日"><Input type="date" value={form.date} onChange={e=>set("date",e.target.value)}/></Field>
+      <div style={{display:"flex",gap:8,marginTop:18}}>
+        <button onClick={onClose}
+          style={{background:"transparent",border:"1px solid rgba(255,255,255,0.15)",color:"#6a9bb8",borderRadius:10,padding:"12px 16px",fontSize:14,cursor:"pointer"}}>
+          キャンセル
+        </button>
+        <button onClick={handleSave}
+          style={{flex:1,background:"#f5a623",color:"#1a0a00",border:"none",borderRadius:10,padding:12,fontSize:15,fontWeight:700,cursor:"pointer"}}>
+          💾 保存する
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+function IOModal({show,onClose,spots,onImport,onClear}){
+  const fileRef=useRef();
+
+  const handleExport=()=>{
+    if(!spots.length){alert("登録されているポイントがありません");return;}
+    const json=JSON.stringify({version:2,exportedAt:new Date().toISOString(),spots},null,2);
+    const blob=new Blob([json],{type:"application/json"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    a.href=url; a.download="fishing_spots.json";
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a); URL.revokeObjectURL(url);
+  };
+
+  const handleImport=e=>{
+    const file=e.target.files[0]; if(!file)return;
+    const reader=new FileReader();
+    reader.onload=ev=>{
+      try{
+        const data=JSON.parse(ev.target.result);
+        const inc=data.spots||(Array.isArray(data)?data:[]);
+        if(!inc.length){alert("データが見つかりませんでした");return;}
+        onImport(inc);
+      }catch{alert("読み込みに失敗しました");}
+      e.target.value="";
+    };
+    reader.readAsText(file);
+  };
+
+  const handleClear=()=>{
+    if(!confirm("⚠️ 全データを削除します。バックアップはとりましたか？"))return;
+    onClear(); onClose();
+  };
+
+  const ioBtn=(emoji,title,sub,onClick,col)=>(
+    <button onClick={onClick} style={{width:"100%",padding:13,borderRadius:10,fontSize:14,fontWeight:600,
+      cursor:"pointer",marginBottom:8,display:"flex",alignItems:"center",gap:10,
+      background:`rgba(${col},0.1)`,border:`1px solid rgba(${col},0.3)`,color:`rgb(${col})`}}>
+      <span style={{fontSize:20}}>{emoji}</span>
+      <div style={{textAlign:"left"}}>
+        <div style={{fontWeight:700}}>{title}</div>
+        <div style={{fontSize:11,opacity:0.8,marginTop:1}}>{sub}</div>
+      </div>
+    </button>
+  );
+
+  return (
+    <Modal show={show} onClose={onClose}>
+      <h2 style={{fontSize:16,fontWeight:700,color:"#fff",marginBottom:16}}>📂 データの保存・読み込み</h2>
+      <div style={{fontSize:11,color:"#f5a623",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:8}}>💾 バックアップ</div>
+      {ioBtn("📤","JSONファイルに書き出す","fishing_spots.json としてダウンロード",handleExport,"46,204,135")}
+      <div style={{fontSize:11,color:"#6a9bb8",lineHeight:1.7,padding:"8px 10px",
+        background:"rgba(255,255,255,0.04)",borderRadius:8,border:"1px solid rgba(255,255,255,0.08)",marginBottom:16}}>
+        <strong style={{color:"#d0e8f5"}}>データの持ち運び方：</strong><br/>
+        ① 書き出しボタンで fishing_spots.json をダウンロード<br/>
+        ② iCloud Driveの釣りフォルダに保存<br/>
+        ③ 次回アプリを開いたら「読み込み」で復元
+      </div>
+      <div style={{fontSize:11,color:"#f5a623",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:8}}>📥 復元</div>
+      {ioBtn("📂","JSONファイルを読み込む","保存済みの fishing_spots.json を選択",()=>fileRef.current.click(),"245,166,35")}
+      <input ref={fileRef} type="file" accept=".json" onChange={handleImport} style={{display:"none"}}/>
+      <div style={{fontSize:11,color:"#6a9bb8",lineHeight:1.7,padding:"8px 10px",
+        background:"rgba(255,255,255,0.04)",borderRadius:8,border:"1px solid rgba(255,255,255,0.08)",marginBottom:16}}>
+        現在のデータに<strong style={{color:"#d0e8f5"}}>追記</strong>されます（重複は自動スキップ）。
+      </div>
+      <div style={{fontSize:11,color:"#f5a623",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:8}}>🗑 リセット</div>
+      {ioBtn("⚠️","全データを削除する","削除前に必ずバックアップを取ってください",handleClear,"232,76,61")}
+      <button onClick={onClose}
+        style={{width:"100%",padding:12,borderRadius:10,fontSize:14,cursor:"pointer",
+          background:"transparent",border:"1px solid rgba(255,255,255,0.15)",color:"#6a9bb8",marginTop:4}}>
+        閉じる
+      </button>
+    </Modal>
+  );
+}
+
+function SpotCard({spot,onEdit,onDelete}){
+  const tags=[];
+  if(spot.area) tags.push(AREA_LABEL[spot.area]||spot.area);
+  if(spot.type) tags.push(TYPE_LABEL[spot.type]||spot.type);
+  if(spot.parking) tags.push("🅿");
+  if(spot.toilet)  tags.push("🚻");
+  if(spot.paid)    tags.push("💰有料");
+  if(spot.night)   tags.push("🌙夜OK");
+  if(spot.beginner)tags.push("🐟初心者向け");
+  if(spot.crowded) tags.push("👥混雑注意");
+  if(spot.fish) spot.fish.split(/[,、，]/).map(f=>f.trim()).filter(Boolean).forEach(f=>tags.push("🐠"+f));
+
+  const aUrl=appleUrl(spot);
+  const gUrl=googleUrl(spot);
+  const coordStr=spot.lat&&spot.lng?`${parseFloat(spot.lat).toFixed(4)}, ${parseFloat(spot.lng).toFixed(4)}`:"";
+
+  return (
+    <div style={{background:"rgba(255,255,255,0.06)",borderRadius:12,padding:"13px 14px",
+      borderLeft:`3px solid ${STATUS_COLOR[spot.status]}`,
+      border:"1px solid rgba(255,255,255,0.1)",borderLeftWidth:3,borderLeftColor:STATUS_COLOR[spot.status]}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+        <div style={{fontSize:15,fontWeight:700,color:"#fff",flex:1,lineHeight:1.3}}>{spot.name}</div>
+        <span style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:10,
+          background:STATUS_BG[spot.status],color:STATUS_COLOR[spot.status],whiteSpace:"nowrap"}}>
+          {STATUS_LABEL[spot.status]}
+        </span>
+      </div>
+      {spot.star>0&&<div style={{fontSize:13,color:"#f5a623",marginTop:5}}>{stars(spot.star)}</div>}
+      {tags.length>0&&(
+        <div style={{display:"flex",flexWrap:"wrap",gap:5,marginTop:7}}>
+          {tags.map((t,i)=>(
+            <span key={i} style={{fontSize:11,background:"rgba(255,255,255,0.08)",borderRadius:4,padding:"2px 6px",color:"#6a9bb8"}}>{t}</span>
+          ))}
+        </div>
+      )}
+      {spot.addr&&(
+        <div style={{fontSize:11,color:"#6a9bb8",marginTop:6,display:"flex",alignItems:"center",gap:5}}>
+          📍 <span>{spot.addr}</span>
+          {coordStr&&<span style={{opacity:0.5,fontSize:10}}>({coordStr})</span>}
+        </div>
+      )}
+      {spot.note&&(
+        <div style={{fontSize:12,color:"#6a9bb8",marginTop:7,lineHeight:1.6}}>
+          {spot.note.slice(0,100)}{spot.note.length>100?"…":""}
+        </div>
+      )}
+      <div style={{fontSize:10,color:"rgba(106,155,184,0.5)",marginTop:5}}>
+        {spot.date?`偵察日：${spot.date}`:"日付未記録"}
+      </div>
+      {(aUrl||gUrl)&&(
+        <div style={{display:"flex",gap:6,marginTop:9,flexWrap:"wrap"}}>
+          {aUrl&&<a href={aUrl} target="_blank" rel="noreferrer"
+            style={{fontSize:11,padding:"6px 10px",borderRadius:8,fontWeight:600,
+              display:"flex",alignItems:"center",gap:4,
+              background:"rgba(255,255,255,0.12)",color:"#fff",textDecoration:"none"}}>
+            🗺 Apple Maps
+          </a>}
+          {gUrl&&<a href={gUrl} target="_blank" rel="noreferrer"
+            style={{fontSize:11,padding:"6px 10px",borderRadius:8,fontWeight:600,
+              display:"flex",alignItems:"center",gap:4,
+              background:"rgba(66,133,244,0.25)",color:"#7ab3ff",textDecoration:"none"}}>
+            📍 Google Maps
+          </a>}
+        </div>
+      )}
+      <div style={{display:"flex",gap:6,marginTop:8}}>
+        <button onClick={()=>onEdit(spot)}
+          style={{fontSize:11,padding:"5px 10px",borderRadius:6,
+            border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#6a9bb8",cursor:"pointer"}}>
+          ✏️ 編集
+        </button>
+        <button onClick={()=>onDelete(spot.id)}
+          style={{fontSize:11,padding:"5px 10px",borderRadius:6,
+            border:"1px solid rgba(232,76,61,0.4)",background:"transparent",color:"rgba(232,76,61,0.8)",cursor:"pointer"}}>
+          🗑 削除
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function App(){
+  const [spots,setSpots]=useState(()=>{
+    try{ const d=localStorage.getItem(LS_KEY); return d?JSON.parse(d):[]; }catch{ return []; }
+  });
+  const [filter,setFilter]=useState("all");
+  const [search,setSearch]=useState("");
+  const [showEdit,setShowEdit]=useState(false);
+  const [showIO,setShowIO]=useState(false);
+  const [editTarget,setEditTarget]=useState(null);
+
+  useEffect(()=>{
+    try{ localStorage.setItem(LS_KEY,JSON.stringify(spots)); }catch(e){}
+  },[spots]);
+
+  const filtered=spots.filter(s=>{
+    const mf=filter==="all"?true:filter==="fav"?s.star>=4:
+      filter==="nishiizu"?s.area==="nishiizu":filter==="higashiizu"?s.area==="higashiizu":
+      filter==="minamiizu"?s.area==="minamiizu":filter==="numazu"?s.area==="numazu":s.status===filter;
+    const q=search.trim().toLowerCase();
+    const mq=!q||(s.name||"").toLowerCase().includes(q)||(s.note||"").toLowerCase().includes(q)||
+      (s.fish||"").toLowerCase().includes(q)||(s.addr||"").toLowerCase().includes(q);
+    return mf&&mq;
+  });
+
+  const openAdd=()=>{setEditTarget(null);setShowEdit(true);};
+  const openEdit=s=>{setEditTarget(s);setShowEdit(true);};
+
+  const handleSave=form=>{
+    if(editTarget?.id){
+      setSpots(prev=>prev.map(s=>s.id===editTarget.id?{...form,id:editTarget.id,updatedAt:Date.now()}:s));
+    }else{
+      setSpots(prev=>[{...form,id:uid(),updatedAt:Date.now()},...prev]);
+    }
+    setShowEdit(false);
+  };
+
+  const handleDelete=id=>{
+    if(!confirm("このポイントを削除しますか？"))return;
+    setSpots(prev=>prev.filter(s=>s.id!==id));
+  };
+
+  const handleImport=incoming=>{
+    setSpots(prev=>{
+      const ids=new Set(prev.map(s=>s.id));
+      let added=0;
+      const newOnes=incoming.filter(s=>{if(!ids.has(s.id)){added++;return true;}return false;});
+      alert(`✅ ${added}件のポイントを読み込みました（重複スキップ：${incoming.length-added}件）`);
+      return [...newOnes,...prev];
+    });
+  };
+
+  const chips=[
+    ["all","すべて"],["ok","✅ 釣り可"],["ng","❌ NG"],["tbc","🔍 要確認"],["fav","⭐ お気に入り"],
+    ["numazu","沼津"],["nishiizu","西伊豆"],["higashiizu","東伊豆"],["minamiizu","南伊豆"],
+  ];
+
+  const Stat=({label,val,color})=>(
+    <div style={{flex:1,textAlign:"center",padding:"9px 4px",borderRight:"1px solid rgba(255,255,255,0.1)"}}>
+      <div style={{fontSize:19,fontWeight:700,color:color||"#fff"}}>{val}</div>
+      <div style={{fontSize:10,color:"#6a9bb8",marginTop:1}}>{label}</div>
+    </div>
+  );
+
+  return (
+    <div style={{background:"#061a2e",minHeight:"100vh",color:"#d0e8f5"}}>
+      {/* Header */}
+      <div style={{background:"linear-gradient(135deg,#0a2a4a,#0d3a5c)",padding:"14px 16px",
+        borderBottom:"1px solid rgba(255,255,255,0.1)",display:"flex",alignItems:"center",
+        justifyContent:"space-between",gap:8,position:"sticky",top:0,zIndex:50}}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <span style={{fontSize:20}}>🎣</span>
+          <div>
+            <div style={{fontSize:16,fontWeight:700,color:"#fff"}}>My 釣りポイント帳</div>
+            <div style={{fontSize:10,color:"#6a9bb8",marginTop:1}}>偵察・お気に入り釣り場を管理</div>
+          </div>
+        </div>
+        <div style={{display:"flex",gap:6}}>
+          <button onClick={()=>setShowIO(true)}
+            style={{background:"rgba(255,255,255,0.1)",color:"#d0e8f5",
+              border:"1px solid rgba(255,255,255,0.15)",borderRadius:8,padding:"7px 10px",fontSize:12,cursor:"pointer"}}>
+            📂 保存/読込
+          </button>
+          <button onClick={openAdd}
+            style={{background:"#f5a623",color:"#1a0a00",border:"none",borderRadius:8,
+              padding:"7px 12px",fontSize:13,fontWeight:700,cursor:"pointer"}}>
+            ＋ 追加
+          </button>
+        </div>
+      </div>
+
+      {/* Stats */}
+      <div style={{display:"flex",borderBottom:"1px solid rgba(255,255,255,0.1)",background:"rgba(0,0,0,0.25)"}}>
+        <Stat label="合計" val={spots.length}/>
+        <Stat label="✅ 釣り可" val={spots.filter(s=>s.status==="ok").length} color="#2ecc87"/>
+        <Stat label="❌ NG" val={spots.filter(s=>s.status==="ng").length} color="#e84c3d"/>
+        <Stat label="🔍 要確認" val={spots.filter(s=>s.status==="tbc").length} color="#f5a623"/>
+        <div style={{flex:1,textAlign:"center",padding:"9px 4px"}}>
+          <div style={{fontSize:19,fontWeight:700,color:"#f5c842"}}>{spots.filter(s=>s.star>=4).length}</div>
+          <div style={{fontSize:10,color:"#6a9bb8",marginTop:1}}>⭐ お気に入り</div>
+        </div>
+      </div>
+
+      {/* Search */}
+      <div style={{padding:"10px 14px",borderBottom:"1px solid rgba(255,255,255,0.1)",background:"#0a2a4a"}}>
+        <input value={search} onChange={e=>setSearch(e.target.value)}
+          placeholder="🔍 ポイント名・魚種・メモで検索…"
+          style={{width:"100%",background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",
+            borderRadius:8,padding:"8px 12px",color:"#d0e8f5",fontSize:13,outline:"none",boxSizing:"border-box"}}/>
+      </div>
+
+      {/* Filter */}
+      <div style={{padding:"8px 14px",display:"flex",gap:6,flexWrap:"wrap",
+        borderBottom:"1px solid rgba(255,255,255,0.1)",background:"#0a2a4a"}}>
+        {chips.map(([f,label])=>(
+          <button key={f} onClick={()=>setFilter(f)}
+            style={{background:filter===f?"#0d3a5c":"rgba(255,255,255,0.06)",
+              border:`1px solid ${filter===f?"#f5a623":"rgba(255,255,255,0.1)"}`,
+              color:filter===f?"#f5a623":"#6a9bb8",fontWeight:filter===f?700:400,
+              borderRadius:20,padding:"4px 11px",fontSize:11,cursor:"pointer",whiteSpace:"nowrap"}}>
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {/* List */}
+      <div style={{padding:"12px 14px",display:"flex",flexDirection:"column",gap:10}}>
+        {filtered.length===0?(
+          <div style={{textAlign:"center",padding:"48px 20px",color:"#6a9bb8",fontSize:13,lineHeight:2}}>
+            <div style={{fontSize:38,marginBottom:10}}>{spots.length?"🔍":"🎣"}</div>
+            {spots.length?"絞り込み結果がありません":
+              <span>「＋ 追加」ボタンで最初の釣り場を記録しましょう！<br/>
+              データは「📂 保存/読込」でJSONに書き出し、<br/>次回読み込むと復元できます。</span>}
+          </div>
+        ):filtered.map(s=>(
+          <SpotCard key={s.id} spot={s} onEdit={openEdit} onDelete={handleDelete}/>
+        ))}
+      </div>
+
+      <EditModal show={showEdit} onClose={()=>setShowEdit(false)} onSave={handleSave} initial={editTarget}/>
+      <IOModal show={showIO} onClose={()=>setShowIO(false)} spots={spots} onImport={handleImport} onClear={()=>setSpots([])}/>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
