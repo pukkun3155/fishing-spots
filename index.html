@@ -24,9 +24,53 @@ const STATUS_LABEL = { ok:"釣り可", ng:"禁止・NG", tbc:"要確認" };
 const STATUS_COLOR = { ok:"#2ecc87", ng:"#e84c3d", tbc:"#f5a623" };
 const STATUS_BG    = { ok:"rgba(46,204,135,0.15)", ng:"rgba(232,76,61,0.15)", tbc:"rgba(245,166,35,0.15)" };
 const LS_KEY = "fishing_spots_v4";
+const TRIPS_KEY = "fishing_trips_v1";
+const GEAR_KEY = "fishing_gear_templates_v1";
+const RIGGUIDE_KEY = "fishing_rig_guides_v1";
+const SESSION_KEY = "fishing_active_session_v1";
 
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
 function stars(n){ return "★".repeat(n)+"☆".repeat(5-n); }
+
+function loadStore(key,fallback){
+  try{ const raw=localStorage.getItem(key); return raw===null?fallback:JSON.parse(raw); }
+  catch{ return fallback; }
+}
+function saveStore(key,value){ try{ localStorage.setItem(key,JSON.stringify(value)); }catch(e){} }
+
+const EMPTY_TRIP = {
+  id:"", spotId:"", spotName:"", date:"",
+  startAt:null, endAt:null, durationMin:null,
+  targetFish:"", rig:"", bait:"",
+  biteCount:0, catchCount:0, catchNote:"",
+  events:[],
+  good:"", hard:"", bringNextTime:"", improveNextTime:"",
+  castDistance:"", tide:"", tideDirection:"", weather:"", temp:"", wind:"", waves:"", turbidity:"", crowding:"",
+  troubleNote:"", memo:"",
+  isBouzu:false,
+  createdAt:null, updatedAt:null,
+};
+
+const SEED_GEAR_TEMPLATES = [
+  { id:"gear-shirogisu", name:"シロギス・ちょい投げ", createdAt:Date.now(), updatedAt:Date.now(), items:[
+    "竿","リール","仕掛け","予備仕掛け","オモリ","予備オモリ","エサ","スナップ／サルカン類","ハサミ","タオル",
+    "ウェットティッシュ","ゴミ袋","手洗い用の水","クーラーボックス","保冷剤または氷","飲み物",
+  ].map(label=>({id:uid(),label,checked:false})) },
+];
+
+const SEED_RIG_GUIDES = [
+  { id:"rig-shirogisu", name:"シロギス・ちょい投げ",
+    chain:["リール","道糸","(リーダー)","スナップ付きサルカン","天秤・オモリ","針仕掛け","エサ"],
+    steps:[
+      {n:1,title:"① リールを竿に取り付ける",detail:"リールシートにしっかり固定し、ガタつきがないか確認します。"},
+      {n:2,title:"② 道糸をガイドに通す",detail:"竿先まで全てのガイドに順番に通します。飛ばしてしまうと投げた瞬間に絡まります。"},
+      {n:3,title:"③ 接続部分を結ぶ",detail:"道糸の先にスナップ付きサルカンを結束します。"},
+      {n:4,title:"④ 結束強度を確認",detail:"軽く引っ張って結び目がすっぽ抜けないか確認します。"},
+      {n:5,title:"⑤ 仕掛けを装着",detail:"天秤・オモリとキス針仕掛けをスナップに接続します。"},
+      {n:6,title:"⑥ エサを付ける",detail:"針にエサ（イソメ等）を付けます。"},
+      {n:7,title:"⑦ 投げる前の安全確認",detail:"周囲に人がいないか確認してから投げましょう。"},
+    ]},
+];
 
 const EMPTY = {
   name:"", area:"", type:"", status:"tbc", star:0,
@@ -284,7 +328,7 @@ function IOModal({show,onClose,spots,onImport,onClear}){
   );
 }
 
-function SpotCard({spot,onEdit,onDelete}){
+function SpotCard({spot,onEdit,onDelete,onStartFishing}){
   const tags=[];
   if(spot.area) tags.push(AREA_LABEL[spot.area]||spot.area);
   if(spot.type) tags.push(TYPE_LABEL[spot.type]||spot.type);
@@ -349,7 +393,12 @@ function SpotCard({spot,onEdit,onDelete}){
           </a>}
         </div>
       )}
-      <div style={{display:"flex",gap:6,marginTop:8}}>
+      <button onClick={()=>onStartFishing(spot)}
+        style={{width:"100%",marginTop:9,padding:"9px 0",borderRadius:8,fontSize:13,fontWeight:700,
+          border:"1px solid rgba(245,166,35,0.4)",background:"rgba(245,166,35,0.15)",color:"#f5a623",cursor:"pointer"}}>
+        🎣 ここで釣り開始
+      </button>
+      <div style={{display:"flex",gap:6,marginTop:6}}>
         <button onClick={()=>onEdit(spot)}
           style={{fontSize:11,padding:"5px 10px",borderRadius:6,
             border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#6a9bb8",cursor:"pointer"}}>
@@ -365,7 +414,7 @@ function SpotCard({spot,onEdit,onDelete}){
   );
 }
 
-function App(){
+function SpotsTab({onStartFishing}){
   const [spots,setSpots]=useState(()=>{
     try{ const d=localStorage.getItem(LS_KEY); return d?JSON.parse(d):[]; }catch{ return []; }
   });
@@ -499,12 +548,458 @@ function App(){
               データは「📂 保存/読込」でJSONに書き出し、<br/>次回読み込むと復元できます。</span>}
           </div>
         ):filtered.map(s=>(
-          <SpotCard key={s.id} spot={s} onEdit={openEdit} onDelete={handleDelete}/>
+          <SpotCard key={s.id} spot={s} onEdit={openEdit} onDelete={handleDelete} onStartFishing={onStartFishing}/>
         ))}
       </div>
 
       <EditModal show={showEdit} onClose={()=>setShowEdit(false)} onSave={handleSave} initial={editTarget}/>
       <IOModal show={showIO} onClose={()=>setShowIO(false)} spots={spots} onImport={handleImport} onClear={()=>setSpots([])}/>
+    </div>
+  );
+}
+
+function BottomNav({tab,onChange}){
+  const items=[["spots","📍","ポイント"],["today","🎣","今日"],["stats","📊","分析"],["trips","📖","記録"],["gear","🎒","持ち物"]];
+  return (
+    <div style={{position:"fixed",left:0,right:0,bottom:0,display:"flex",zIndex:200,
+      background:"#0a2a4a",borderTop:"1px solid rgba(255,255,255,0.1)"}}>
+      {items.map(([key,emoji,label])=>(
+        <button key={key} onClick={()=>onChange(key)}
+          style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:2,
+            padding:"8px 0 10px",background:"none",border:"none",cursor:"pointer",
+            color:tab===key?"#f5a623":"#6a9bb8",fontWeight:tab===key?700:400}}>
+          <span style={{fontSize:20}}>{emoji}</span><span style={{fontSize:10}}>{label}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function ActionButton({emoji,title,sub,onClick,col}){
+  return (
+    <button onClick={onClick} style={{width:"100%",padding:13,borderRadius:10,fontSize:14,fontWeight:600,
+      cursor:"pointer",marginBottom:8,display:"flex",alignItems:"center",gap:10,
+      background:`rgba(${col},0.1)`,border:`1px solid rgba(${col},0.3)`,color:`rgb(${col})`}}>
+      <span style={{fontSize:20}}>{emoji}</span>
+      <div style={{textAlign:"left"}}>
+        <div style={{fontWeight:700}}>{title}</div>
+        {sub&&<div style={{fontSize:11,opacity:0.8,marginTop:1}}>{sub}</div>}
+      </div>
+    </button>
+  );
+}
+
+function Toast({text}){
+  if(!text) return null;
+  return (
+    <div style={{position:"fixed",left:"50%",bottom:80,transform:"translateX(-50%)",
+      background:"#0d3a5c",color:"#fff",padding:"9px 18px",borderRadius:20,fontSize:13,fontWeight:600,
+      border:"1px solid rgba(245,166,35,0.4)",zIndex:250,whiteSpace:"nowrap"}}>
+      {text}
+    </div>
+  );
+}
+
+function EndSessionModal({show,onClose,onSave}){
+  const [form,setForm]=useState({good:"",hard:"",bringNextTime:"",improveNextTime:""});
+  useEffect(()=>{ if(show) setForm({good:"",hard:"",bringNextTime:"",improveNextTime:""}); },[show]);
+  const set=(k,v)=>setForm(f=>({...f,[k]:v}));
+  return (
+    <Modal show={show} onClose={onClose}>
+      <h2 style={{fontSize:16,fontWeight:700,color:"#fff",marginBottom:16}}>🏁 釣行を振り返る（任意）</h2>
+      <Field label="良かったこと"><Textarea value={form.good} onChange={e=>set("good",e.target.value)}/></Field>
+      <Field label="困ったこと"><Textarea value={form.hard} onChange={e=>set("hard",e.target.value)}/></Field>
+      <Field label="次回持っていく物"><Input value={form.bringNextTime} onChange={e=>set("bringNextTime",e.target.value)}/></Field>
+      <Field label="次回改善すること"><Textarea value={form.improveNextTime} onChange={e=>set("improveNextTime",e.target.value)}/></Field>
+      <div style={{display:"flex",gap:8,marginTop:18}}>
+        <button onClick={()=>onSave({})}
+          style={{background:"transparent",border:"1px solid rgba(255,255,255,0.15)",color:"#6a9bb8",borderRadius:10,padding:"12px 16px",fontSize:14,cursor:"pointer"}}>
+          スキップして終了
+        </button>
+        <button onClick={()=>onSave(form)}
+          style={{flex:1,background:"#f5a623",color:"#1a0a00",border:"none",borderRadius:10,padding:12,fontSize:15,fontWeight:700,cursor:"pointer"}}>
+          💾 保存して終了
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+function TodayFishingView({activeSession,onSwitchToSpots,onLogEvent,onEndSession}){
+  const [showEnd,setShowEnd]=useState(false);
+  const [toast,setToast]=useState("");
+  const flash=msg=>{ setToast(msg); clearTimeout(flash._t); flash._t=setTimeout(()=>setToast(""),1400); };
+
+  if(!activeSession){
+    return (
+      <div style={{padding:"48px 20px",textAlign:"center",color:"#6a9bb8",fontSize:13,lineHeight:2}}>
+        <div style={{fontSize:38,marginBottom:10}}>🎣</div>
+        進行中の釣行がありません。<br/>
+        「📍 ポイント」タブでスポットを選び、<br/>「🎣 ここで釣り開始」から始めましょう。
+        <div style={{marginTop:16}}>
+          <button onClick={onSwitchToSpots}
+            style={{background:"#f5a623",color:"#1a0a00",border:"none",borderRadius:10,padding:"10px 18px",fontSize:14,fontWeight:700,cursor:"pointer"}}>
+            📍 ポイントを選ぶ
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const elapsed=Math.max(0,Math.round((Date.now()-activeSession.startAt)/60000));
+  const actions=[
+    ["bite","👆","アタリ","46,204,135"],
+    ["catch","🐟","釣れた","245,166,35"],
+    ["rig_change","🔧","仕掛け交換","106,155,184"],
+    ["trouble","⚠️","トラブル","232,76,61"],
+  ];
+
+  return (
+    <div style={{padding:"16px 14px"}}>
+      <div style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:12,padding:"14px 16px",marginBottom:14}}>
+        <div style={{fontSize:15,fontWeight:700,color:"#fff"}}>{activeSession.spotName||"（スポット未設定）"}</div>
+        <div style={{fontSize:12,color:"#6a9bb8",marginTop:4}}>
+          開始 {new Date(activeSession.startAt).toLocaleTimeString("ja-JP",{hour:"2-digit",minute:"2-digit"})}（経過 {elapsed}分）
+        </div>
+        <div style={{display:"flex",gap:14,marginTop:8,fontSize:12,color:"#d0e8f5"}}>
+          <span>👆 アタリ {activeSession.biteCount||0}</span>
+          <span>🐟 釣果 {activeSession.catchCount||0}</span>
+        </div>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+        {actions.map(([type,emoji,label,col])=>(
+          <button key={type} onClick={()=>{onLogEvent(type);flash(`${emoji} ${label} を記録しました`);}}
+            style={{padding:"18px 8px",borderRadius:12,fontSize:14,fontWeight:700,cursor:"pointer",
+              background:`rgba(${col},0.12)`,border:`1px solid rgba(${col},0.35)`,color:`rgb(${col})`}}>
+            <div style={{fontSize:26,marginBottom:4}}>{emoji}</div>{label}
+          </button>
+        ))}
+      </div>
+
+      <button onClick={()=>{
+          const note=prompt("メモを入力してください");
+          if(note!==null&&note.trim()){onLogEvent("memo",note.trim());flash("📝 メモを記録しました");}
+        }}
+        style={{width:"100%",padding:"12px 8px",borderRadius:10,fontSize:14,fontWeight:600,cursor:"pointer",marginBottom:10,
+          background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.15)",color:"#d0e8f5"}}>
+        📝 メモを追加
+      </button>
+
+      <button onClick={()=>setShowEnd(true)}
+        style={{width:"100%",padding:14,borderRadius:10,fontSize:15,fontWeight:700,cursor:"pointer",
+          background:"#e84c3d",border:"none",color:"#fff"}}>
+        🏁 釣り終了
+      </button>
+
+      {activeSession.events?.length>0&&(
+        <div style={{marginTop:16}}>
+          <div style={{fontSize:11,color:"#6a9bb8",fontWeight:700,letterSpacing:"0.05em",textTransform:"uppercase",marginBottom:8}}>ログ</div>
+          <div style={{display:"flex",flexDirection:"column",gap:6}}>
+            {[...activeSession.events].reverse().map(ev=>(
+              <div key={ev.id} style={{fontSize:12,color:"#6a9bb8",display:"flex",gap:8}}>
+                <span style={{opacity:0.6}}>{new Date(ev.ts).toLocaleTimeString("ja-JP",{hour:"2-digit",minute:"2-digit"})}</span>
+                <span>{({bite:"👆 アタリ",catch:"🐟 釣れた",rig_change:"🔧 仕掛け交換",trouble:"⚠️ トラブル",memo:"📝 "+ev.note})[ev.type]||ev.type}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <Toast text={toast}/>
+      <EndSessionModal show={showEnd} onClose={()=>setShowEnd(false)} onSave={review=>{setShowEnd(false);onEndSession(review);}}/>
+    </div>
+  );
+}
+
+function AnalyticsPlaceholderView({tripsCount}){
+  return (
+    <div style={{padding:"48px 20px",textAlign:"center",color:"#6a9bb8",fontSize:13,lineHeight:2}}>
+      <div style={{fontSize:38,marginBottom:10}}>📊</div>
+      統計・分析機能は今後追加予定です。<br/>
+      現在の記録済み釣行：{tripsCount}件
+    </div>
+  );
+}
+
+function TripEditModal({show,onClose,onSave,initial}){
+  const [form,setForm]=useState(EMPTY_TRIP);
+  useEffect(()=>{ if(show) setForm(initial||EMPTY_TRIP); },[show,initial]);
+  const set=(k,v)=>setForm(f=>({...f,[k]:v}));
+  return (
+    <Modal show={show} onClose={onClose}>
+      <h2 style={{fontSize:16,fontWeight:700,color:"#fff",marginBottom:16}}>✏️ 釣行記録を編集</h2>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+        <Field label="狙い魚"><Input value={form.targetFish} onChange={e=>set("targetFish",e.target.value)}/></Field>
+        <Field label="実釣果メモ"><Input value={form.catchNote} onChange={e=>set("catchNote",e.target.value)}/></Field>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+        <Field label="仕掛け"><Input value={form.rig} onChange={e=>set("rig",e.target.value)}/></Field>
+        <Field label="エサ"><Input value={form.bait} onChange={e=>set("bait",e.target.value)}/></Field>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+        <Field label="天気"><Input value={form.weather} onChange={e=>set("weather",e.target.value)}/></Field>
+        <Field label="気温"><Input value={form.temp} onChange={e=>set("temp",e.target.value)}/></Field>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+        <Field label="風"><Input value={form.wind} onChange={e=>set("wind",e.target.value)}/></Field>
+        <Field label="波"><Input value={form.waves} onChange={e=>set("waves",e.target.value)}/></Field>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+        <Field label="潮回り"><Input value={form.tide} onChange={e=>set("tide",e.target.value)}/></Field>
+        <Field label="満潮／干潮との関係"><Input value={form.tideDirection} onChange={e=>set("tideDirection",e.target.value)}/></Field>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+        <Field label="濁り"><Input value={form.turbidity} onChange={e=>set("turbidity",e.target.value)}/></Field>
+        <Field label="混雑"><Input value={form.crowding} onChange={e=>set("crowding",e.target.value)}/></Field>
+      </div>
+      <Field label="投げた距離の目安"><Input value={form.castDistance} onChange={e=>set("castDistance",e.target.value)}/></Field>
+      <Field label="トラブル"><Textarea value={form.troubleNote} onChange={e=>set("troubleNote",e.target.value)}/></Field>
+      <Field label="メモ"><Textarea value={form.memo} onChange={e=>set("memo",e.target.value)}/></Field>
+      <div style={{display:"flex",gap:8,marginTop:18}}>
+        <button onClick={onClose}
+          style={{background:"transparent",border:"1px solid rgba(255,255,255,0.15)",color:"#6a9bb8",borderRadius:10,padding:"12px 16px",fontSize:14,cursor:"pointer"}}>
+          キャンセル
+        </button>
+        <button onClick={()=>onSave(form)}
+          style={{flex:1,background:"#f5a623",color:"#1a0a00",border:"none",borderRadius:10,padding:12,fontSize:15,fontWeight:700,cursor:"pointer"}}>
+          💾 保存する
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+function TripCard({trip,onEdit,onDelete}){
+  const start=trip.startAt?new Date(trip.startAt):null;
+  const end=trip.endAt?new Date(trip.endAt):null;
+  const fmt=d=>d?d.toLocaleTimeString("ja-JP",{hour:"2-digit",minute:"2-digit"}):"";
+  return (
+    <div style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",
+      borderLeft:`3px solid ${trip.isBouzu?"#e84c3d":"#2ecc87"}`,borderRadius:12,padding:"13px 14px"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+        <div style={{fontSize:15,fontWeight:700,color:"#fff",flex:1}}>{trip.spotName||"（スポット不明）"}</div>
+        <span style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:10,whiteSpace:"nowrap",
+          background:trip.isBouzu?"rgba(232,76,61,0.15)":"rgba(46,204,135,0.15)",
+          color:trip.isBouzu?"#e84c3d":"#2ecc87"}}>
+          {trip.isBouzu?"🐟 ボウズ":`🐟 釣果 ${trip.catchCount}`}
+        </span>
+      </div>
+      <div style={{fontSize:11,color:"#6a9bb8",marginTop:6}}>
+        {trip.date} {fmt(start)}〜{fmt(end)}{trip.durationMin!=null?`（${trip.durationMin}分）`:""}
+      </div>
+      {trip.targetFish&&<div style={{fontSize:12,color:"#d0e8f5",marginTop:6}}>狙い魚：{trip.targetFish}</div>}
+      <div style={{fontSize:11,color:"#6a9bb8",marginTop:4}}>👆 アタリ {trip.biteCount||0}</div>
+      {trip.memo&&<div style={{fontSize:12,color:"#6a9bb8",marginTop:7,lineHeight:1.6}}>{trip.memo}</div>}
+      <div style={{display:"flex",gap:6,marginTop:9}}>
+        <button onClick={()=>onEdit(trip)}
+          style={{fontSize:11,padding:"5px 10px",borderRadius:6,
+            border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#6a9bb8",cursor:"pointer"}}>
+          ✏️ 編集
+        </button>
+        <button onClick={()=>onDelete(trip.id)}
+          style={{fontSize:11,padding:"5px 10px",borderRadius:6,
+            border:"1px solid rgba(232,76,61,0.4)",background:"transparent",color:"rgba(232,76,61,0.8)",cursor:"pointer"}}>
+          🗑 削除
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function TripLogView({trips,onUpdate,onDelete}){
+  const [editTarget,setEditTarget]=useState(null);
+  return (
+    <div style={{padding:"12px 14px"}}>
+      <div style={{fontSize:16,fontWeight:700,color:"#fff",marginBottom:10}}>📖 釣行記録</div>
+      {trips.length===0?(
+        <div style={{textAlign:"center",padding:"48px 20px",color:"#6a9bb8",fontSize:13,lineHeight:2}}>
+          <div style={{fontSize:38,marginBottom:10}}>📖</div>
+          まだ釣行記録がありません。<br/>「🎣 今日」タブから釣行を開始しましょう。
+        </div>
+      ):(
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          {trips.map(t=>(
+            <TripCard key={t.id} trip={t} onEdit={setEditTarget} onDelete={onDelete}/>
+          ))}
+        </div>
+      )}
+      <TripEditModal show={!!editTarget} onClose={()=>setEditTarget(null)} initial={editTarget}
+        onSave={form=>{onUpdate(editTarget.id,form);setEditTarget(null);}}/>
+    </div>
+  );
+}
+
+function GearChecklistView({template,onToggleItem,onAddItem,onRemoveItem,onResetAll}){
+  const [newItem,setNewItem]=useState("");
+  if(!template) return null;
+  return (
+    <div>
+      <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:12}}>
+        {template.items.map(item=>(
+          <div key={item.id} style={{display:"flex",alignItems:"center",gap:8}}>
+            <CheckItem label={item.label} checked={item.checked} onChange={v=>onToggleItem(item.id,v)}/>
+            <button onClick={()=>onRemoveItem(item.id)}
+              style={{background:"none",border:"none",color:"rgba(232,76,61,0.7)",fontSize:14,cursor:"pointer",padding:4}}>
+              ✕
+            </button>
+          </div>
+        ))}
+      </div>
+      <div style={{display:"flex",gap:8,marginBottom:10}}>
+        <Input placeholder="持ち物を追加…" value={newItem} onChange={e=>setNewItem(e.target.value)}/>
+        <button onClick={()=>{ if(newItem.trim()){onAddItem(newItem.trim());setNewItem("");} }}
+          style={{background:"#f5a623",color:"#1a0a00",border:"none",borderRadius:9,padding:"0 16px",fontSize:14,fontWeight:700,cursor:"pointer"}}>
+          追加
+        </button>
+      </div>
+      <button onClick={onResetAll}
+        style={{width:"100%",padding:10,borderRadius:9,fontSize:13,cursor:"pointer",
+          background:"transparent",border:"1px solid rgba(255,255,255,0.15)",color:"#6a9bb8"}}>
+        チェックを全部リセット
+      </button>
+    </div>
+  );
+}
+
+function RigGuideView({guide}){
+  const [step,setStep]=useState(0);
+  if(!guide) return null;
+  const s=guide.steps[step];
+  return (
+    <div>
+      <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:16}}>
+        {guide.chain.map((c,i)=>(
+          <span key={i} style={{fontSize:11,background:"rgba(255,255,255,0.08)",borderRadius:4,padding:"3px 8px",color:"#6a9bb8"}}>
+            {c}{i<guide.chain.length-1?" →":""}
+          </span>
+        ))}
+      </div>
+      <div style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:12,padding:16,minHeight:120}}>
+        <div style={{fontSize:15,fontWeight:700,color:"#fff",marginBottom:8}}>{s.title}</div>
+        <div style={{fontSize:13,color:"#6a9bb8",lineHeight:1.7}}>{s.detail}</div>
+      </div>
+      <div style={{display:"flex",gap:8,marginTop:12,alignItems:"center",justifyContent:"space-between"}}>
+        <button disabled={step===0} onClick={()=>setStep(s=>s-1)}
+          style={{padding:"9px 16px",borderRadius:9,fontSize:13,cursor:step===0?"default":"pointer",
+            background:"transparent",border:"1px solid rgba(255,255,255,0.15)",color:step===0?"rgba(106,155,184,0.4)":"#6a9bb8"}}>
+          ← 前へ
+        </button>
+        <span style={{fontSize:12,color:"#6a9bb8"}}>{step+1} / {guide.steps.length}</span>
+        <button disabled={step===guide.steps.length-1} onClick={()=>setStep(s=>s+1)}
+          style={{padding:"9px 16px",borderRadius:9,fontSize:13,fontWeight:700,cursor:step===guide.steps.length-1?"default":"pointer",
+            background:step===guide.steps.length-1?"transparent":"#f5a623",
+            border:step===guide.steps.length-1?"1px solid rgba(255,255,255,0.15)":"none",
+            color:step===guide.steps.length-1?"rgba(106,155,184,0.4)":"#1a0a00"}}>
+          次へ →
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function GearTab({gearTemplates,setGearTemplates,rigGuides}){
+  const [sub,setSub]=useState("gear");
+  const template=gearTemplates[0]||null;
+  const guide=rigGuides[0]||null;
+
+  const updateTemplate=updater=>{
+    setGearTemplates(prev=>prev.map((t,i)=>i===0?updater(t):t));
+  };
+  const onToggleItem=(id,checked)=>updateTemplate(t=>({...t,items:t.items.map(it=>it.id===id?{...it,checked}:it),updatedAt:Date.now()}));
+  const onAddItem=label=>updateTemplate(t=>({...t,items:[...t.items,{id:uid(),label,checked:false}],updatedAt:Date.now()}));
+  const onRemoveItem=id=>updateTemplate(t=>({...t,items:t.items.filter(it=>it.id!==id),updatedAt:Date.now()}));
+  const onResetAll=()=>{ if(confirm("チェックを全部リセットしますか？")) updateTemplate(t=>({...t,items:t.items.map(it=>({...it,checked:false})),updatedAt:Date.now()})); };
+
+  return (
+    <div style={{padding:"12px 14px"}}>
+      <div style={{fontSize:16,fontWeight:700,color:"#fff",marginBottom:10}}>🎒 {template?template.name:"持ち物"}</div>
+      <div style={{display:"flex",gap:6,marginBottom:14}}>
+        {[["gear","✅ チェックリスト"],["guide","🪝 仕掛けガイド"]].map(([k,l])=>(
+          <button key={k} onClick={()=>setSub(k)}
+            style={{background:sub===k?"#0d3a5c":"rgba(255,255,255,0.06)",
+              border:`1px solid ${sub===k?"#f5a623":"rgba(255,255,255,0.1)"}`,
+              color:sub===k?"#f5a623":"#6a9bb8",fontWeight:sub===k?700:400,
+              borderRadius:20,padding:"5px 12px",fontSize:12,cursor:"pointer"}}>
+            {l}
+          </button>
+        ))}
+      </div>
+      {sub==="gear"
+        ?<GearChecklistView template={template} onToggleItem={onToggleItem} onAddItem={onAddItem} onRemoveItem={onRemoveItem} onResetAll={onResetAll}/>
+        :<RigGuideView guide={guide}/>}
+    </div>
+  );
+}
+
+function App(){
+  const [tab,setTab]=useState(()=>loadStore(SESSION_KEY,{schemaVersion:1,session:null}).session?"today":"spots");
+  const [activeSession,setActiveSession]=useState(()=>loadStore(SESSION_KEY,{schemaVersion:1,session:null}).session);
+  const [trips,setTrips]=useState(()=>loadStore(TRIPS_KEY,{schemaVersion:1,trips:[]}).trips);
+  const [gearTemplates,setGearTemplates]=useState(()=>{
+    const store=loadStore(GEAR_KEY,null);
+    if(store===null){ saveStore(GEAR_KEY,{schemaVersion:1,templates:SEED_GEAR_TEMPLATES}); return SEED_GEAR_TEMPLATES; }
+    return store.templates;
+  });
+  const [rigGuides,setRigGuides]=useState(()=>{
+    const store=loadStore(RIGGUIDE_KEY,null);
+    if(store===null){ saveStore(RIGGUIDE_KEY,{schemaVersion:1,guides:SEED_RIG_GUIDES}); return SEED_RIG_GUIDES; }
+    return store.guides;
+  });
+
+  useEffect(()=>{ saveStore(SESSION_KEY,{schemaVersion:1,session:activeSession}); },[activeSession]);
+  useEffect(()=>{ saveStore(TRIPS_KEY,{schemaVersion:1,trips}); },[trips]);
+  useEffect(()=>{ saveStore(GEAR_KEY,{schemaVersion:1,templates:gearTemplates}); },[gearTemplates]);
+  useEffect(()=>{ saveStore(RIGGUIDE_KEY,{schemaVersion:1,guides:rigGuides}); },[rigGuides]);
+
+  const handleStartFishing=spot=>{
+    if(activeSession&&!confirm("進行中のセッションがあります。終了して新しく開始しますか？"))return;
+    setActiveSession({...EMPTY_TRIP,id:uid(),spotId:spot.id,spotName:spot.name,
+      startAt:Date.now(),date:new Date().toISOString().slice(0,10)});
+    setTab("today");
+  };
+
+  const handleLogEvent=(type,note)=>{
+    setActiveSession(prev=>{
+      if(!prev)return prev;
+      const ev={id:uid(),ts:Date.now(),type,note:note||""};
+      const next={...prev,events:[...prev.events,ev]};
+      if(type==="bite")next.biteCount=(next.biteCount||0)+1;
+      if(type==="catch")next.catchCount=(next.catchCount||0)+1;
+      return next;
+    });
+  };
+
+  const handleEndSession=review=>{
+    setActiveSession(prev=>{
+      if(!prev)return prev;
+      const endAt=Date.now();
+      const durationMin=prev.startAt?Math.round((endAt-prev.startAt)/60000):null;
+      const finished={...prev,...review,endAt,durationMin,
+        isBouzu:(prev.catchCount||0)===0,updatedAt:Date.now(),createdAt:prev.createdAt||Date.now()};
+      setTrips(t=>[finished,...t]);
+      return null;
+    });
+    setTab("trips");
+  };
+
+  const handleUpdateTrip=(id,form)=>{
+    setTrips(prev=>prev.map(t=>t.id===id?{...t,...form,updatedAt:Date.now()}:t));
+  };
+  const handleDeleteTrip=id=>{
+    if(!confirm("この釣行記録を削除しますか？"))return;
+    setTrips(prev=>prev.filter(t=>t.id!==id));
+  };
+
+  return (
+    <div style={{background:"#061a2e",minHeight:"100vh",color:"#d0e8f5",paddingBottom:64}}>
+      {tab==="spots"&&<SpotsTab onStartFishing={handleStartFishing}/>}
+      {tab==="today"&&<TodayFishingView activeSession={activeSession} onSwitchToSpots={()=>setTab("spots")}
+        onLogEvent={handleLogEvent} onEndSession={handleEndSession}/>}
+      {tab==="stats"&&<AnalyticsPlaceholderView tripsCount={trips.length}/>}
+      {tab==="trips"&&<TripLogView trips={trips} onUpdate={handleUpdateTrip} onDelete={handleDeleteTrip}/>}
+      {tab==="gear"&&<GearTab gearTemplates={gearTemplates} setGearTemplates={setGearTemplates} rigGuides={rigGuides}/>}
+      <BottomNav tab={tab} onChange={setTab}/>
     </div>
   );
 }
