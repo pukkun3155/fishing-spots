@@ -28,6 +28,12 @@ const TRIPS_KEY = "fishing_trips_v1";
 const GEAR_KEY = "fishing_gear_templates_v1";
 const RIGGUIDE_KEY = "fishing_rig_guides_v1";
 const SESSION_KEY = "fishing_active_session_v1";
+const CATCHES_KEY = "fishing_catches_v1";
+const FISHMASTER_KEY = "fishing_fishmaster_v1";
+const RECIPES_KEY = "fishing_recipes_v1";
+const MEALS_KEY = "fishing_meals_v1";
+const HOMEPROGRESS_KEY = "fishing_home_progress_v1";
+const UNKNOWN_FISH = "魚種不明";
 
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
 function stars(n){ return "★".repeat(n)+"☆".repeat(5-n); }
@@ -71,6 +77,100 @@ const SEED_RIG_GUIDES = [
       {n:7,title:"⑦ 投げる前の安全確認",detail:"周囲に人がいないか確認してから投げましょう。"},
     ]},
 ];
+
+const EMPTY_CATCH = {
+  id:"", tripId:"", caughtAt:null,
+  fishName:"", count:1, sizeCm:"",
+  kept:true, released:false,
+  note:"",
+  handlingStatus:"pending",
+  homeProcessingChecked:[],
+  createdAt:null, updatedAt:null,
+};
+
+const DEFAULT_HOME_PROGRESS = { step:1, selectedRecipeId:null, customDishName:"", cookedAt:null };
+
+const SEED_FISH_MASTER = [
+  { name:"シロギス", aliases:["キス"], edible:true, dangerLevel:"none", dangerNote:"",
+    handling:["針を外す","必要なら締める","海水で軽く汚れを落とす（洗いすぎない）","ビニール袋に入れる","氷か保冷剤でしっかり冷やす"],
+    bleedingRecommended:false, chilling:"氷または保冷剤で冷やしたクーラーボックスへ入れる",
+    homeProcessing:["ウロコを取る","エラを取る","内臓を取る","血合いを洗い流す","水分をしっかり拭き取る","すぐ調理しないなら冷蔵（当日中）または冷凍"],
+    recommendedRecipes:["天ぷら","唐揚げ","フライ","塩焼き"] },
+  { name:"アジ", aliases:["マアジ"], edible:true, dangerLevel:"low", dangerNote:"体側のゼイゴ（硬いウロコ）で手を切ることがあるので注意。",
+    handling:["針を外す（ゼイゴに注意）","締める","血抜きをする","海水で軽くすすぐ","氷でしっかり冷やす"],
+    bleedingRecommended:true, chilling:"氷水（海水氷）に浸けて素早く冷やすと身質が保たれる",
+    homeProcessing:["ゼイゴを取る","ウロコを取る","エラと内臓を取る","血合いを洗う","水分を拭き取る","冷蔵または冷凍"],
+    recommendedRecipes:["塩焼き","フライ","なめろう","刺身"] },
+  { name:"サバ", aliases:["マサバ"], edible:true, dangerLevel:"none", dangerNote:"傷みが早い魚のため、他の魚以上に冷却と処理の速さが重要（食あたり予防）。",
+    handling:["針を外す","締める","血抜きをする","素早く冷やす（常温放置は避ける）"],
+    bleedingRecommended:true, chilling:"氷締め・氷水でとにかく早く冷やす",
+    homeProcessing:["ウロコを取る","エラと内臓を取る","血合いをよく洗う","水分を拭き取る","冷蔵は当日中、保存するなら早めに冷凍"],
+    recommendedRecipes:["塩焼き","味噌煮","フライ"] },
+  { name:"イワシ", aliases:["マイワシ"], edible:true, dangerLevel:"none", dangerNote:"うろこが取れやすく、傷みも早いので取り扱いに注意。",
+    handling:["針を外す（弱りやすいので優しく）","氷でできるだけ早く冷やす"],
+    bleedingRecommended:false, chilling:"氷水に浸けて素早く冷やす",
+    homeProcessing:["手開きでウロコ・頭・内臓を取る","よく洗って水分を拭き取る","冷蔵は当日中、冷凍も可"],
+    recommendedRecipes:["梅煮","フライ","つみれ汁"] },
+  { name:"カサゴ", aliases:["ガシラ"], edible:true, dangerLevel:"low", dangerNote:"背びれ・エラブタなどに鋭いトゲがあり、刺さると痛みが強い。素手で持たず魚バサミやグリップを使う。",
+    handling:["トゲに注意して針を外す（魚バサミ推奨）","締める","氷でしっかり冷やす"],
+    bleedingRecommended:false, chilling:"氷でしっかり冷やす",
+    homeProcessing:["トゲに注意しながらウロコを取る","エラと内臓を取る","水分を拭き取る","冷蔵または冷凍"],
+    recommendedRecipes:["煮付け","唐揚げ","味噌汁"] },
+  { name:"メバル", aliases:[], edible:true, dangerLevel:"low", dangerNote:"背びれのトゲが鋭いので取り扱いに注意。",
+    handling:["トゲに注意して針を外す","締める","氷で冷やす"],
+    bleedingRecommended:false, chilling:"氷でしっかり冷やす",
+    homeProcessing:["ウロコを取る","エラと内臓を取る","水分を拭き取る","冷蔵または冷凍"],
+    recommendedRecipes:["煮付け","唐揚げ"] },
+  { name:"クロダイ", aliases:["チヌ"], edible:true, dangerLevel:"none", dangerNote:"エラ蓋の縁が鋭いことがあるので手を入れる際は注意。",
+    handling:["針を外す","締める","血抜きをする","氷で冷やす"],
+    bleedingRecommended:true, chilling:"氷でしっかり冷やす",
+    homeProcessing:["ウロコを取る","エラと内臓を取る","血合いを洗う","水分を拭き取る","冷蔵または冷凍"],
+    recommendedRecipes:["塩焼き","刺身","煮付け"] },
+  { name:"マダイ", aliases:["タイ"], edible:true, dangerLevel:"low", dangerNote:"ヒレが硬く鋭いので取り扱いに注意。",
+    handling:["針を外す","締める","血抜きをする","氷で冷やす"],
+    bleedingRecommended:true, chilling:"氷でしっかり冷やす",
+    homeProcessing:["ウロコを取る","エラと内臓を取る","血合いを洗う","水分を拭き取る","冷蔵または冷凍"],
+    recommendedRecipes:["刺身","塩焼き","昆布締め"] },
+];
+
+const SEED_RECIPES = [
+  { id:"r-shirogisu-tenpura", name:"天ぷら", fish:"シロギス", suitableSize:"小型〜中型（10〜20cm）",
+    difficulty:"ふつう", cookingTime:"20分",
+    preparation:"三枚おろしにして骨を取り、水分をよく拭き取る。",
+    steps:["衣（薄力粉・冷水・卵）を用意する","魚に薄く粉をまぶす","衣にくぐらせる","170〜180℃の油できつね色になるまで揚げる","油をよく切って完成"] },
+  { id:"r-shirogisu-karaage", name:"唐揚げ", fish:"シロギス", suitableSize:"小型（〜15cm）",
+    difficulty:"やさしい", cookingTime:"20分",
+    preparation:"頭とワタを取り、よく洗って水分を拭き取る。",
+    steps:["醤油・酒・生姜で下味をつける（10分ほど）","片栗粉をまぶす","170℃程度の油でカラッと揚げる","油をよく切って完成"] },
+  { id:"r-shirogisu-furai", name:"フライ", fish:"シロギス", suitableSize:"中型（15〜20cm）",
+    difficulty:"ふつう", cookingTime:"25分",
+    preparation:"三枚おろしにして骨を取り、水分をよく拭き取る。",
+    steps:["塩コショウで下味をつける","小麦粉→溶き卵→パン粉の順に衣をつける","170〜180℃の油できつね色になるまで揚げる","油をよく切ってソースやレモンを添えて完成"] },
+  { id:"r-shirogisu-shioyaki", name:"塩焼き", fish:"シロギス", suitableSize:"中型〜大型（15cm〜）",
+    difficulty:"やさしい", cookingTime:"20分",
+    preparation:"ウロコと内臓を取り、よく洗って水分を拭き取る。",
+    steps:["両面に軽く塩をふる","10分ほど置いて余分な水分をふき取る","グリルまたはフライパンで両面をこんがり焼く","焼き色がついたら完成"] },
+];
+
+function sizeCategory(sizeCm){
+  const n=parseFloat(sizeCm);
+  if(!n) return null;
+  if(n<13) return "small";
+  if(n<18) return "medium";
+  return "large";
+}
+const SIZE_RECIPE_PRIORITY = {
+  small:["r-shirogisu-karaage","r-shirogisu-tenpura","r-shirogisu-furai","r-shirogisu-shioyaki"],
+  medium:["r-shirogisu-tenpura","r-shirogisu-furai","r-shirogisu-shioyaki","r-shirogisu-karaage"],
+  large:["r-shirogisu-shioyaki","r-shirogisu-furai","r-shirogisu-tenpura","r-shirogisu-karaage"],
+};
+function recommendRecipes(recipes,fishName,sizeCm){
+  const matched=recipes.filter(r=>r.fish===fishName);
+  const cat=sizeCategory(sizeCm);
+  const order=cat&&SIZE_RECIPE_PRIORITY[cat];
+  if(!order) return matched;
+  return [...matched].sort((a,b)=>order.indexOf(a.id)-order.indexOf(b.id));
+}
 
 const EMPTY = {
   name:"", area:"", type:"", status:"tbc", star:0,
@@ -625,8 +725,117 @@ function EndSessionModal({show,onClose,onSave}){
   );
 }
 
-function TodayFishingView({activeSession,onSwitchToSpots,onLogEvent,onEndSession}){
+function CatchQuickModal({show,onClose,onSave,fishMaster}){
+  const [fishName,setFishName]=useState("");
+  const [count,setCount]=useState(1);
+  const [kept,setKept]=useState(true);
+  useEffect(()=>{ if(show){ setFishName(""); setCount(1); setKept(true); } },[show]);
+
+  const handleSave=()=>{
+    if(!fishName){ alert("魚種を選択してください"); return; }
+    onSave({fishName,count:Math.max(1,parseInt(count,10)||1),kept});
+  };
+
+  return (
+    <Modal show={show} onClose={onClose}>
+      <h2 style={{fontSize:16,fontWeight:700,color:"#fff",marginBottom:16}}>🐟 釣れた魚を記録</h2>
+      <Field label="魚種 *">
+        <Sel value={fishName} onChange={e=>setFishName(e.target.value)}>
+          <option value="">選択してください</option>
+          {fishMaster.map(f=><option key={f.name} value={f.name}>{f.name}</option>)}
+          <option value={UNKNOWN_FISH}>❓ {UNKNOWN_FISH}</option>
+        </Sel>
+      </Field>
+      <Field label="数">
+        <Input type="number" min="1" value={count} onChange={e=>setCount(e.target.value)}/>
+      </Field>
+      <Field label="持ち帰り or リリース">
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={()=>setKept(true)}
+            style={{flex:1,padding:"12px 0",borderRadius:10,fontSize:14,fontWeight:700,cursor:"pointer",
+              background:kept?"rgba(245,166,35,0.2)":"rgba(255,255,255,0.06)",
+              border:`1px solid ${kept?"#f5a623":"rgba(255,255,255,0.15)"}`,
+              color:kept?"#f5a623":"#6a9bb8"}}>
+            🧊 持ち帰る
+          </button>
+          <button onClick={()=>setKept(false)}
+            style={{flex:1,padding:"12px 0",borderRadius:10,fontSize:14,fontWeight:700,cursor:"pointer",
+              background:!kept?"rgba(46,204,135,0.2)":"rgba(255,255,255,0.06)",
+              border:`1px solid ${!kept?"#2ecc87":"rgba(255,255,255,0.15)"}`,
+              color:!kept?"#2ecc87":"#6a9bb8"}}>
+            🌊 リリース
+          </button>
+        </div>
+      </Field>
+      <div style={{fontSize:11,color:"#6a9bb8",lineHeight:1.6,marginTop:4}}>
+        サイズやメモは後から「記録」タブで編集できます。
+      </div>
+      <div style={{display:"flex",gap:8,marginTop:18}}>
+        <button onClick={onClose}
+          style={{background:"transparent",border:"1px solid rgba(255,255,255,0.15)",color:"#6a9bb8",borderRadius:10,padding:"12px 16px",fontSize:14,cursor:"pointer"}}>
+          キャンセル
+        </button>
+        <button onClick={handleSave}
+          style={{flex:1,background:"#f5a623",color:"#1a0a00",border:"none",borderRadius:10,padding:12,fontSize:15,fontWeight:700,cursor:"pointer"}}>
+          💾 記録する
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+function UnknownFishWarning(){
+  return (
+    <div style={{background:"rgba(232,76,61,0.15)",border:"1px solid rgba(232,76,61,0.4)",borderRadius:12,padding:16}}>
+      <div style={{fontSize:16,fontWeight:700,color:"#e84c3d",marginBottom:8}}>⚠️ 食べずに魚種確認を優先</div>
+      <div style={{fontSize:13,color:"#d0e8f5",lineHeight:1.7}}>
+        魚種が特定できていません。危険な棘や毒を持つ魚の可能性があるため、
+        素手で強くつかまず、詳しい人や図鑑・アプリ等で魚種を確認してから
+        食用可否を判断してください。それまでは冷やして安全に保管するだけに留めましょう。
+      </div>
+    </div>
+  );
+}
+
+function OnsiteHandlingGuide({catchItem,fishMaster,onClose,onDone}){
+  const fish=fishMaster.find(f=>f.name===catchItem.fishName);
+  return (
+    <div onClick={e=>{if(e.target===e.currentTarget)onClose();}}
+      style={{position:"fixed",inset:0,background:"rgba(6,26,46,0.97)",zIndex:280,
+        overflowY:"auto",padding:"20px 16px 32px"}}>
+      <div style={{fontSize:18,fontWeight:700,color:"#fff",marginBottom:4}}>🧤 現地での処理</div>
+      <div style={{fontSize:13,color:"#6a9bb8",marginBottom:16}}>{catchItem.fishName}（{catchItem.count}匹）</div>
+      {!fish?(
+        <UnknownFishWarning/>
+      ):(
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          {fish.dangerLevel!=="none"&&(
+            <div style={{background:"rgba(232,76,61,0.15)",border:"1px solid rgba(232,76,61,0.4)",
+              borderRadius:10,padding:"12px 14px",fontSize:14,color:"#e84c3d",fontWeight:700}}>
+              ⚠️ {fish.dangerNote}
+            </div>
+          )}
+          {fish.handling.map((step,i)=>(
+            <div key={i} style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",
+              borderRadius:12,padding:"16px 18px",fontSize:16,fontWeight:600,color:"#fff"}}>
+              {i+1}. {step}
+            </div>
+          ))}
+        </div>
+      )}
+      <button onClick={onDone}
+        style={{width:"100%",marginTop:20,padding:16,borderRadius:12,fontSize:16,fontWeight:700,cursor:"pointer",
+          background:"#f5a623",border:"none",color:"#1a0a00"}}>
+        ✅ 処理完了
+      </button>
+    </div>
+  );
+}
+
+function TodayFishingView({activeSession,catches,fishMaster,onSwitchToSpots,onLogEvent,onLogCatch,onUpdateCatch,onEndSession,onOpenHomeMode}){
   const [showEnd,setShowEnd]=useState(false);
+  const [showCatch,setShowCatch]=useState(false);
+  const [onsiteCatch,setOnsiteCatch]=useState(null);
   const [toast,setToast]=useState("");
   const flash=msg=>{ setToast(msg); clearTimeout(flash._t); flash._t=setTimeout(()=>setToast(""),1400); };
 
@@ -646,6 +855,8 @@ function TodayFishingView({activeSession,onSwitchToSpots,onLogEvent,onEndSession
     );
   }
 
+  const sessionCatches=catches.filter(c=>c.tripId===activeSession.id);
+  const keptCatches=sessionCatches.filter(c=>c.kept);
   const elapsed=Math.max(0,Math.round((Date.now()-activeSession.startAt)/60000));
   const actions=[
     ["bite","👆","アタリ","46,204,135"],
@@ -653,6 +864,20 @@ function TodayFishingView({activeSession,onSwitchToSpots,onLogEvent,onEndSession
     ["rig_change","🔧","仕掛け交換","106,155,184"],
     ["trouble","⚠️","トラブル","232,76,61"],
   ];
+
+  const handleAction=type=>{
+    if(type==="catch"){ setShowCatch(true); return; }
+    onLogEvent(type);
+    const found=actions.find(a=>a[0]===type);
+    flash(`${found[1]} ${found[2]} を記録しました`);
+  };
+
+  const handleSaveCatch=({fishName,count,kept})=>{
+    setShowCatch(false);
+    const rec=onLogCatch({fishName,count,kept});
+    if(kept) setOnsiteCatch(rec);
+    else flash("🌊 リリースしました");
+  };
 
   return (
     <div style={{padding:"16px 14px"}}>
@@ -669,7 +894,7 @@ function TodayFishingView({activeSession,onSwitchToSpots,onLogEvent,onEndSession
 
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
         {actions.map(([type,emoji,label,col])=>(
-          <button key={type} onClick={()=>{onLogEvent(type);flash(`${emoji} ${label} を記録しました`);}}
+          <button key={type} onClick={()=>handleAction(type)}
             style={{padding:"18px 8px",borderRadius:12,fontSize:14,fontWeight:700,cursor:"pointer",
               background:`rgba(${col},0.12)`,border:`1px solid rgba(${col},0.35)`,color:`rgb(${col})`}}>
             <div style={{fontSize:26,marginBottom:4}}>{emoji}</div>{label}
@@ -686,11 +911,36 @@ function TodayFishingView({activeSession,onSwitchToSpots,onLogEvent,onEndSession
         📝 メモを追加
       </button>
 
+      {keptCatches.length>0&&(
+        <button onClick={onOpenHomeMode}
+          style={{width:"100%",padding:"12px 8px",borderRadius:10,fontSize:14,fontWeight:700,cursor:"pointer",marginBottom:10,
+            background:"rgba(245,166,35,0.15)",border:"1px solid rgba(245,166,35,0.4)",color:"#f5a623"}}>
+          🏠 帰宅後の処理へ（持ち帰り {keptCatches.length}件）
+        </button>
+      )}
+
       <button onClick={()=>setShowEnd(true)}
         style={{width:"100%",padding:14,borderRadius:10,fontSize:15,fontWeight:700,cursor:"pointer",
           background:"#e84c3d",border:"none",color:"#fff"}}>
         🏁 釣り終了
       </button>
+
+      {sessionCatches.length>0&&(
+        <div style={{marginTop:16}}>
+          <div style={{fontSize:11,color:"#6a9bb8",fontWeight:700,letterSpacing:"0.05em",textTransform:"uppercase",marginBottom:8}}>🐟 釣果一覧</div>
+          <div style={{display:"flex",flexDirection:"column",gap:6}}>
+            {sessionCatches.map(c=>(
+              <div key={c.id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,
+                background:"rgba(255,255,255,0.05)",borderRadius:8,padding:"7px 10px"}}>
+                <span style={{fontSize:12,color:"#d0e8f5"}}>{c.fishName} × {c.count}（{c.kept?"持ち帰り":"リリース"}）</span>
+                {c.kept&&<button onClick={()=>setOnsiteCatch(c)}
+                  style={{fontSize:11,padding:"3px 8px",borderRadius:6,border:"1px solid rgba(245,166,35,0.4)",
+                    background:"transparent",color:"#f5a623",cursor:"pointer"}}>処理ガイド</button>}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {activeSession.events?.length>0&&(
         <div style={{marginTop:16}}>
@@ -699,7 +949,7 @@ function TodayFishingView({activeSession,onSwitchToSpots,onLogEvent,onEndSession
             {[...activeSession.events].reverse().map(ev=>(
               <div key={ev.id} style={{fontSize:12,color:"#6a9bb8",display:"flex",gap:8}}>
                 <span style={{opacity:0.6}}>{new Date(ev.ts).toLocaleTimeString("ja-JP",{hour:"2-digit",minute:"2-digit"})}</span>
-                <span>{({bite:"👆 アタリ",catch:"🐟 釣れた",rig_change:"🔧 仕掛け交換",trouble:"⚠️ トラブル",memo:"📝 "+ev.note})[ev.type]||ev.type}</span>
+                <span>{ev.type==="catch"||ev.type==="memo"?"📝 "+ev.note:({bite:"👆 アタリ",rig_change:"🔧 仕掛け交換",trouble:"⚠️ トラブル"})[ev.type]||ev.type}</span>
               </div>
             ))}
           </div>
@@ -707,6 +957,10 @@ function TodayFishingView({activeSession,onSwitchToSpots,onLogEvent,onEndSession
       )}
 
       <Toast text={toast}/>
+      <CatchQuickModal show={showCatch} onClose={()=>setShowCatch(false)} onSave={handleSaveCatch} fishMaster={fishMaster}/>
+      {onsiteCatch&&<OnsiteHandlingGuide catchItem={onsiteCatch} fishMaster={fishMaster}
+        onClose={()=>setOnsiteCatch(null)}
+        onDone={()=>{onUpdateCatch(onsiteCatch.id,{handlingStatus:"onsite_done"});setOnsiteCatch(null);}}/>}
       <EndSessionModal show={showEnd} onClose={()=>setShowEnd(false)} onSave={review=>{setShowEnd(false);onEndSession(review);}}/>
     </div>
   );
@@ -770,10 +1024,55 @@ function TripEditModal({show,onClose,onSave,initial}){
   );
 }
 
-function TripCard({trip,onEdit,onDelete}){
+const HANDLING_STATUS_LABEL = {
+  pending:"現地処理待ち", released:"リリース済み", onsite_done:"現地処理済み",
+  home_processed:"下処理済み", cooked:"調理済み",
+};
+
+function CatchEditModal({show,onClose,onSave,initial}){
+  const [form,setForm]=useState(EMPTY_CATCH);
+  useEffect(()=>{ if(show) setForm(initial||EMPTY_CATCH); },[show,initial]);
+  const set=(k,v)=>setForm(f=>({...f,[k]:v}));
+  const handleSave=()=>{
+    if(!form.fishName.trim()){ alert("魚種を入力してください"); return; }
+    onSave(form);
+  };
+  return (
+    <Modal show={show} onClose={onClose}>
+      <h2 style={{fontSize:16,fontWeight:700,color:"#fff",marginBottom:16}}>✏️ 釣果を編集</h2>
+      <Field label="魚種"><Input value={form.fishName} onChange={e=>set("fishName",e.target.value)}/></Field>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+        <Field label="数"><Input type="number" min="1" value={form.count} onChange={e=>set("count",parseInt(e.target.value,10)||1)}/></Field>
+        <Field label="サイズ（cm・任意）"><Input type="number" step="any" value={form.sizeCm} onChange={e=>set("sizeCm",e.target.value)}/></Field>
+      </div>
+      <Field label="持ち帰り or リリース">
+        <Sel value={form.kept?"kept":"released"} onChange={e=>set("kept",e.target.value==="kept")}>
+          <option value="kept">🧊 持ち帰る</option>
+          <option value="released">🌊 リリース</option>
+        </Sel>
+      </Field>
+      <Field label="メモ"><Textarea value={form.note} onChange={e=>set("note",e.target.value)}/></Field>
+      <div style={{display:"flex",gap:8,marginTop:18}}>
+        <button onClick={onClose}
+          style={{background:"transparent",border:"1px solid rgba(255,255,255,0.15)",color:"#6a9bb8",borderRadius:10,padding:"12px 16px",fontSize:14,cursor:"pointer"}}>
+          キャンセル
+        </button>
+        <button onClick={handleSave}
+          style={{flex:1,background:"#f5a623",color:"#1a0a00",border:"none",borderRadius:10,padding:12,fontSize:15,fontWeight:700,cursor:"pointer"}}>
+          💾 保存する
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+function TripCard({trip,catches,onEdit,onDelete,onEditCatch,onDeleteCatch,onAddCatch,onOpenHomeMode,fishMaster}){
   const start=trip.startAt?new Date(trip.startAt):null;
   const end=trip.endAt?new Date(trip.endAt):null;
   const fmt=d=>d?d.toLocaleTimeString("ja-JP",{hour:"2-digit",minute:"2-digit"}):"";
+  const [editCatchTarget,setEditCatchTarget]=useState(null);
+  const [showAddCatch,setShowAddCatch]=useState(false);
+  const keptCount=catches.filter(c=>c.kept).length;
   return (
     <div style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",
       borderLeft:`3px solid ${trip.isBouzu?"#e84c3d":"#2ecc87"}`,borderRadius:12,padding:"13px 14px"}}>
@@ -791,23 +1090,62 @@ function TripCard({trip,onEdit,onDelete}){
       {trip.targetFish&&<div style={{fontSize:12,color:"#d0e8f5",marginTop:6}}>狙い魚：{trip.targetFish}</div>}
       <div style={{fontSize:11,color:"#6a9bb8",marginTop:4}}>👆 アタリ {trip.biteCount||0}</div>
       {trip.memo&&<div style={{fontSize:12,color:"#6a9bb8",marginTop:7,lineHeight:1.6}}>{trip.memo}</div>}
-      <div style={{display:"flex",gap:6,marginTop:9}}>
+
+      {catches.length>0&&(
+        <div style={{marginTop:9,display:"flex",flexDirection:"column",gap:5}}>
+          {catches.map(c=>(
+            <div key={c.id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,
+              background:"rgba(255,255,255,0.05)",borderRadius:8,padding:"6px 9px"}}>
+              <span style={{fontSize:11,color:"#d0e8f5"}}>
+                {c.fishName===UNKNOWN_FISH?"❓ ":"🐟 "}{c.fishName} × {c.count}
+                {c.sizeCm?`（${c.sizeCm}cm）`:""} ・ {c.kept?HANDLING_STATUS_LABEL[c.handlingStatus]||"持ち帰り":"リリース"}
+              </span>
+              <div style={{display:"flex",gap:4}}>
+                <button onClick={()=>setEditCatchTarget(c)}
+                  style={{fontSize:10,padding:"3px 7px",borderRadius:6,border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#6a9bb8",cursor:"pointer"}}>✏️</button>
+                <button onClick={()=>onDeleteCatch(c.id)}
+                  style={{fontSize:10,padding:"3px 7px",borderRadius:6,border:"1px solid rgba(232,76,61,0.4)",background:"transparent",color:"rgba(232,76,61,0.8)",cursor:"pointer"}}>🗑</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{display:"flex",gap:6,marginTop:9,flexWrap:"wrap"}}>
         <button onClick={()=>onEdit(trip)}
           style={{fontSize:11,padding:"5px 10px",borderRadius:6,
             border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#6a9bb8",cursor:"pointer"}}>
           ✏️ 編集
         </button>
+        <button onClick={()=>setShowAddCatch(true)}
+          style={{fontSize:11,padding:"5px 10px",borderRadius:6,
+            border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#6a9bb8",cursor:"pointer"}}>
+          ＋ 釣果を追加
+        </button>
+        {keptCount>0&&(
+          <button onClick={onOpenHomeMode}
+            style={{fontSize:11,padding:"5px 10px",borderRadius:6,fontWeight:700,
+              border:"1px solid rgba(245,166,35,0.4)",background:"rgba(245,166,35,0.15)",color:"#f5a623",cursor:"pointer"}}>
+            🏠 帰宅後
+          </button>
+        )}
         <button onClick={()=>onDelete(trip.id)}
           style={{fontSize:11,padding:"5px 10px",borderRadius:6,
             border:"1px solid rgba(232,76,61,0.4)",background:"transparent",color:"rgba(232,76,61,0.8)",cursor:"pointer"}}>
           🗑 削除
         </button>
       </div>
+
+      <CatchEditModal show={!!editCatchTarget} onClose={()=>setEditCatchTarget(null)} initial={editCatchTarget}
+        onSave={form=>{onEditCatch(editCatchTarget.id,form);setEditCatchTarget(null);}}/>
+      <CatchEditModal show={showAddCatch} onClose={()=>setShowAddCatch(false)}
+        initial={{...EMPTY_CATCH,tripId:trip.id,caughtAt:Date.now()}}
+        onSave={form=>{onAddCatch(trip.id,form);setShowAddCatch(false);}}/>
     </div>
   );
 }
 
-function TripLogView({trips,onUpdate,onDelete}){
+function TripLogView({trips,catches,fishMaster,onUpdate,onDelete,onEditCatch,onDeleteCatch,onAddCatch,onOpenHomeMode}){
   const [editTarget,setEditTarget]=useState(null);
   return (
     <div style={{padding:"12px 14px"}}>
@@ -820,7 +1158,11 @@ function TripLogView({trips,onUpdate,onDelete}){
       ):(
         <div style={{display:"flex",flexDirection:"column",gap:10}}>
           {trips.map(t=>(
-            <TripCard key={t.id} trip={t} onEdit={setEditTarget} onDelete={onDelete}/>
+            <TripCard key={t.id} trip={t} catches={catches.filter(c=>c.tripId===t.id)}
+              fishMaster={fishMaster}
+              onEdit={setEditTarget} onDelete={onDelete}
+              onEditCatch={onEditCatch} onDeleteCatch={onDeleteCatch} onAddCatch={onAddCatch}
+              onOpenHomeMode={()=>onOpenHomeMode(t)}/>
           ))}
         </div>
       )}
@@ -932,6 +1274,264 @@ function GearTab({gearTemplates,setGearTemplates,rigGuides}){
   );
 }
 
+const HOME_STEP_TITLES = {
+  1:"持ち帰った魚の確認", 2:"魚種確認", 3:"下処理", 4:"保存方法", 5:"おすすめ料理", 6:"調理済み", 7:"食後評価",
+};
+
+function HomeStepHeader({step,onClose}){
+  return (
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
+      <div>
+        <div style={{fontSize:16,fontWeight:700,color:"#fff"}}>🏠 帰宅後 ・ ステップ {step}/7</div>
+        <div style={{fontSize:12,color:"#6a9bb8",marginTop:2}}>{HOME_STEP_TITLES[step]}</div>
+      </div>
+      <button onClick={onClose}
+        style={{background:"transparent",border:"1px solid rgba(255,255,255,0.15)",color:"#6a9bb8",
+          borderRadius:8,padding:"6px 10px",fontSize:12,cursor:"pointer"}}>
+        ✕ 閉じる
+      </button>
+    </div>
+  );
+}
+
+function HomeStepNav({step,onBack,onNext,nextLabel}){
+  return (
+    <div style={{display:"flex",gap:8,marginTop:18}}>
+      {step>1&&<button onClick={onBack}
+        style={{background:"transparent",border:"1px solid rgba(255,255,255,0.15)",color:"#6a9bb8",
+          borderRadius:10,padding:"12px 16px",fontSize:14,cursor:"pointer"}}>
+        ← 戻る
+      </button>}
+      <button onClick={onNext}
+        style={{flex:1,background:"#f5a623",color:"#1a0a00",border:"none",borderRadius:10,padding:12,fontSize:15,fontWeight:700,cursor:"pointer"}}>
+        {nextLabel||"次へ →"}
+      </button>
+    </div>
+  );
+}
+
+function HomeModeView({tripId,tripLabel,catches,fishMaster,recipes,progress,onUpdateProgress,onUpdateCatch,onSaveMeal,onClose}){
+  const step=progress.step||1;
+  const goTo=n=>onUpdateProgress({step:n});
+  const identifiedCatches=catches.filter(c=>c.fishName!==UNKNOWN_FISH);
+  const unknownCatches=catches.filter(c=>c.fishName===UNKNOWN_FISH);
+
+  if(catches.length===0){
+    return (
+      <div style={{padding:"16px 14px"}}>
+        <HomeStepHeader step={step} onClose={onClose}/>
+        <div style={{textAlign:"center",padding:"48px 20px",color:"#6a9bb8",fontSize:13,lineHeight:2}}>
+          持ち帰った魚がまだ登録されていません。
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{padding:"16px 14px",paddingBottom:80}}>
+      <HomeStepHeader step={step} onClose={onClose}/>
+      <div style={{fontSize:12,color:"#6a9bb8",marginBottom:14}}>{tripLabel}</div>
+
+      {(step===1||step===2)&&(
+        <div>
+          <div style={{fontSize:13,color:"#d0e8f5",marginBottom:12,lineHeight:1.7}}>
+            持ち帰った魚を確認し、魚種が違っていれば修正してください。
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:10}}>
+            {catches.map(c=>(
+              <div key={c.id} style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:12,padding:"12px 14px"}}>
+                <Field label="魚種">
+                  <Sel value={c.fishName} onChange={e=>onUpdateCatch(c.id,{fishName:e.target.value})}>
+                    {fishMaster.map(f=><option key={f.name} value={f.name}>{f.name}</option>)}
+                    <option value={UNKNOWN_FISH}>❓ {UNKNOWN_FISH}</option>
+                  </Sel>
+                </Field>
+                <div style={{fontSize:12,color:"#6a9bb8"}}>{c.count}匹{c.sizeCm?`・${c.sizeCm}cm`:""}</div>
+                {c.fishName===UNKNOWN_FISH&&<div style={{marginTop:8}}><UnknownFishWarning/></div>}
+              </div>
+            ))}
+          </div>
+          <HomeStepNav step={step} onBack={()=>goTo(1)} onNext={()=>goTo(3)}/>
+        </div>
+      )}
+
+      {step===3&&(
+        <div>
+          {unknownCatches.length>0&&<div style={{marginBottom:12}}><UnknownFishWarning/></div>}
+          <div style={{display:"flex",flexDirection:"column",gap:12}}>
+            {identifiedCatches.map(c=>{
+              const fish=fishMaster.find(f=>f.name===c.fishName);
+              const checked=c.homeProcessingChecked||[];
+              const done=c.handlingStatus==="home_processed"||c.handlingStatus==="cooked";
+              return (
+                <div key={c.id} style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:12,padding:"12px 14px"}}>
+                  <div style={{fontSize:14,fontWeight:700,color:"#fff",marginBottom:8}}>{c.fishName}（{c.count}匹）</div>
+                  {fish?.homeProcessing?.map((s,i)=>(
+                    <label key={i} style={{display:"flex",alignItems:"center",gap:8,fontSize:13,color:"#d0e8f5",padding:"5px 0"}}>
+                      <input type="checkbox" checked={checked.includes(s)} disabled={done}
+                        onChange={e=>{
+                          const next=e.target.checked?[...checked,s]:checked.filter(x=>x!==s);
+                          onUpdateCatch(c.id,{homeProcessingChecked:next});
+                        }}
+                        style={{accentColor:"#f5a623",width:16,height:16}}/>
+                      {s}
+                    </label>
+                  ))}
+                  {!done&&<button onClick={()=>onUpdateCatch(c.id,{handlingStatus:"home_processed"})}
+                    style={{width:"100%",marginTop:8,padding:10,borderRadius:9,fontSize:13,fontWeight:700,cursor:"pointer",
+                      background:"rgba(245,166,35,0.15)",border:"1px solid rgba(245,166,35,0.4)",color:"#f5a623"}}>
+                    この魚の下処理完了
+                  </button>}
+                  {done&&<div style={{fontSize:12,color:"#2ecc87",marginTop:6,fontWeight:700}}>✅ 下処理済み</div>}
+                </div>
+              );
+            })}
+          </div>
+          <HomeStepNav step={step} onBack={()=>goTo(2)} onNext={()=>goTo(4)}/>
+        </div>
+      )}
+
+      {step===4&&(
+        <div>
+          <div style={{display:"flex",flexDirection:"column",gap:10}}>
+            {identifiedCatches.map(c=>{
+              const fish=fishMaster.find(f=>f.name===c.fishName);
+              return (
+                <div key={c.id} style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:12,padding:"12px 14px"}}>
+                  <div style={{fontSize:14,fontWeight:700,color:"#fff",marginBottom:6}}>{c.fishName}</div>
+                  <div style={{fontSize:13,color:"#d0e8f5",lineHeight:1.7}}>{fish?.chilling||"—"}</div>
+                </div>
+              );
+            })}
+            {unknownCatches.length>0&&<UnknownFishWarning/>}
+          </div>
+          <HomeStepNav step={step} onBack={()=>goTo(3)} onNext={()=>goTo(5)}/>
+        </div>
+      )}
+
+      {step===5&&(
+        <div>
+          {identifiedCatches.length===0?(
+            <UnknownFishWarning/>
+          ):identifiedCatches.map(c=>{
+            const fish=fishMaster.find(f=>f.name===c.fishName);
+            const matched=recommendRecipes(recipes,c.fishName,c.sizeCm);
+            return (
+              <div key={c.id} style={{marginBottom:14}}>
+                <div style={{fontSize:14,fontWeight:700,color:"#fff",marginBottom:8}}>{c.fishName} のおすすめ料理</div>
+                {matched.length>0?(
+                  <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                    {matched.map(r=>(
+                      <button key={r.id} onClick={()=>onUpdateProgress({selectedRecipeId:r.id,customDishName:""})}
+                        style={{textAlign:"left",padding:"12px 14px",borderRadius:10,cursor:"pointer",
+                          background:progress.selectedRecipeId===r.id?"rgba(245,166,35,0.2)":"rgba(255,255,255,0.06)",
+                          border:`1px solid ${progress.selectedRecipeId===r.id?"#f5a623":"rgba(255,255,255,0.1)"}`}}>
+                        <div style={{fontSize:14,fontWeight:700,color:progress.selectedRecipeId===r.id?"#f5a623":"#fff"}}>{r.name}</div>
+                        <div style={{fontSize:11,color:"#6a9bb8",marginTop:2}}>{r.suitableSize}・{r.difficulty}・{r.cookingTime}</div>
+                        {progress.selectedRecipeId===r.id&&(
+                          <div style={{marginTop:8,fontSize:12,color:"#d0e8f5",lineHeight:1.7}}>
+                            <div style={{color:"#6a9bb8",marginBottom:4}}>下準備：{r.preparation}</div>
+                            <ol style={{paddingLeft:18}}>{r.steps.map((s,i)=><li key={i}>{s}</li>)}</ol>
+                          </div>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                ):(
+                  <div style={{fontSize:12,color:"#6a9bb8",lineHeight:1.7}}>
+                    詳しいレシピは未登録です。参考候補：{fish?.recommendedRecipes?.join("、")||"—"}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          <Field label="料理名（レシピが無い場合など自由入力）">
+            <Input placeholder="例：塩焼き" value={progress.customDishName}
+              onChange={e=>onUpdateProgress({customDishName:e.target.value,selectedRecipeId:e.target.value?null:progress.selectedRecipeId})}/>
+          </Field>
+          <HomeStepNav step={step} onBack={()=>goTo(4)} onNext={()=>goTo(6)}/>
+        </div>
+      )}
+
+      {step===6&&(
+        <div>
+          <div style={{fontSize:13,color:"#d0e8f5",lineHeight:1.7,marginBottom:14}}>
+            {progress.selectedRecipeId
+              ? `「${recipes.find(r=>r.id===progress.selectedRecipeId)?.name||""}」`
+              : progress.customDishName?`「${progress.customDishName}」`:"料理"}
+            が完成したら押してください。
+          </div>
+          <button onClick={()=>{
+              identifiedCatches.forEach(c=>onUpdateCatch(c.id,{handlingStatus:"cooked"}));
+              onUpdateProgress({cookedAt:Date.now(),step:7});
+            }}
+            style={{width:"100%",padding:16,borderRadius:12,fontSize:16,fontWeight:700,cursor:"pointer",
+              background:"#f5a623",border:"none",color:"#1a0a00"}}>
+            🍳 調理済みにする
+          </button>
+          <HomeStepNav step={step} onBack={()=>goTo(5)} onNext={()=>goTo(7)} nextLabel="食後評価へ →"/>
+        </div>
+      )}
+
+      {step===7&&(
+        <HomeStepMealReview
+          dishName={progress.selectedRecipeId?recipes.find(r=>r.id===progress.selectedRecipeId)?.name:progress.customDishName}
+          fishNames={identifiedCatches.map(c=>c.fishName).join("、")}
+          recipeId={progress.selectedRecipeId}
+          onBack={()=>goTo(6)}
+          onSave={onSaveMeal}/>
+      )}
+    </div>
+  );
+}
+
+function HomeStepMealReview({dishName,fishNames,recipeId,onBack,onSave}){
+  const [tasteRating,setTasteRating]=useState(0);
+  const [easeRating,setEaseRating]=useState(0);
+  const [eatAgain,setEatAgain]=useState(true);
+  const [wantToCatchAgain,setWantToCatchAgain]=useState(true);
+  const [note,setNote]=useState("");
+
+  const handleSave=()=>{
+    onSave({recipeId:recipeId||null,fishName:fishNames,dishName:dishName||"",
+      tasteRating,easeRating,eatAgain,wantToCatchAgain,note,eatenAt:Date.now()});
+  };
+
+  return (
+    <div>
+      <div style={{fontSize:13,color:"#d0e8f5",marginBottom:12}}>{dishName||"（料理名未設定）"}・{fishNames}</div>
+      <Field label="美味しさ"><StarPicker value={tasteRating} onChange={setTasteRating}/></Field>
+      <Field label="作りやすさ"><StarPicker value={easeRating} onChange={setEaseRating}/></Field>
+      <Field label="また食べたい">
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={()=>setEatAgain(true)}
+            style={{flex:1,padding:"10px 0",borderRadius:9,cursor:"pointer",fontWeight:700,
+              background:eatAgain?"rgba(46,204,135,0.2)":"rgba(255,255,255,0.06)",
+              border:`1px solid ${eatAgain?"#2ecc87":"rgba(255,255,255,0.15)"}`,color:eatAgain?"#2ecc87":"#6a9bb8"}}>はい</button>
+          <button onClick={()=>setEatAgain(false)}
+            style={{flex:1,padding:"10px 0",borderRadius:9,cursor:"pointer",fontWeight:700,
+              background:!eatAgain?"rgba(232,76,61,0.2)":"rgba(255,255,255,0.06)",
+              border:`1px solid ${!eatAgain?"#e84c3d":"rgba(255,255,255,0.15)"}`,color:!eatAgain?"#e84c3d":"#6a9bb8"}}>いいえ</button>
+        </div>
+      </Field>
+      <Field label="またこの魚を釣りたい">
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={()=>setWantToCatchAgain(true)}
+            style={{flex:1,padding:"10px 0",borderRadius:9,cursor:"pointer",fontWeight:700,
+              background:wantToCatchAgain?"rgba(46,204,135,0.2)":"rgba(255,255,255,0.06)",
+              border:`1px solid ${wantToCatchAgain?"#2ecc87":"rgba(255,255,255,0.15)"}`,color:wantToCatchAgain?"#2ecc87":"#6a9bb8"}}>はい</button>
+          <button onClick={()=>setWantToCatchAgain(false)}
+            style={{flex:1,padding:"10px 0",borderRadius:9,cursor:"pointer",fontWeight:700,
+              background:!wantToCatchAgain?"rgba(232,76,61,0.2)":"rgba(255,255,255,0.06)",
+              border:`1px solid ${!wantToCatchAgain?"#e84c3d":"rgba(255,255,255,0.15)"}`,color:!wantToCatchAgain?"#e84c3d":"#6a9bb8"}}>いいえ</button>
+        </div>
+      </Field>
+      <Field label="感想"><Textarea value={note} onChange={e=>setNote(e.target.value)}/></Field>
+      <HomeStepNav step={7} onBack={onBack} onNext={handleSave} nextLabel="💾 評価を保存して終了"/>
+    </div>
+  );
+}
+
 function App(){
   const [tab,setTab]=useState(()=>loadStore(SESSION_KEY,{schemaVersion:1,session:null}).session?"today":"spots");
   const [activeSession,setActiveSession]=useState(()=>loadStore(SESSION_KEY,{schemaVersion:1,session:null}).session);
@@ -946,11 +1546,31 @@ function App(){
     if(store===null){ saveStore(RIGGUIDE_KEY,{schemaVersion:1,guides:SEED_RIG_GUIDES}); return SEED_RIG_GUIDES; }
     return store.guides;
   });
+  const [catches,setCatches]=useState(()=>loadStore(CATCHES_KEY,{schemaVersion:1,catches:[]}).catches);
+  const [fishMaster,setFishMaster]=useState(()=>{
+    const store=loadStore(FISHMASTER_KEY,null);
+    if(store===null){ saveStore(FISHMASTER_KEY,{schemaVersion:1,fish:SEED_FISH_MASTER}); return SEED_FISH_MASTER; }
+    return store.fish;
+  });
+  const [recipes,setRecipes]=useState(()=>{
+    const store=loadStore(RECIPES_KEY,null);
+    if(store===null){ saveStore(RECIPES_KEY,{schemaVersion:1,recipes:SEED_RECIPES}); return SEED_RECIPES; }
+    return store.recipes;
+  });
+  const [meals,setMeals]=useState(()=>loadStore(MEALS_KEY,{schemaVersion:1,meals:[]}).meals);
+  const [homeProgress,setHomeProgress]=useState(()=>loadStore(HOMEPROGRESS_KEY,{schemaVersion:1,progress:{}}).progress);
+  const [homeModeTripId,setHomeModeTripId]=useState(null);
+  const [homeModeTripLabel,setHomeModeTripLabel]=useState("");
 
   useEffect(()=>{ saveStore(SESSION_KEY,{schemaVersion:1,session:activeSession}); },[activeSession]);
   useEffect(()=>{ saveStore(TRIPS_KEY,{schemaVersion:1,trips}); },[trips]);
   useEffect(()=>{ saveStore(GEAR_KEY,{schemaVersion:1,templates:gearTemplates}); },[gearTemplates]);
   useEffect(()=>{ saveStore(RIGGUIDE_KEY,{schemaVersion:1,guides:rigGuides}); },[rigGuides]);
+  useEffect(()=>{ saveStore(CATCHES_KEY,{schemaVersion:1,catches}); },[catches]);
+  useEffect(()=>{ saveStore(FISHMASTER_KEY,{schemaVersion:1,fish:fishMaster}); },[fishMaster]);
+  useEffect(()=>{ saveStore(RECIPES_KEY,{schemaVersion:1,recipes}); },[recipes]);
+  useEffect(()=>{ saveStore(MEALS_KEY,{schemaVersion:1,meals}); },[meals]);
+  useEffect(()=>{ saveStore(HOMEPROGRESS_KEY,{schemaVersion:1,progress:homeProgress}); },[homeProgress]);
 
   const handleStartFishing=spot=>{
     if(activeSession&&!confirm("進行中のセッションがあります。終了して新しく開始しますか？"))return;
@@ -965,9 +1585,37 @@ function App(){
       const ev={id:uid(),ts:Date.now(),type,note:note||""};
       const next={...prev,events:[...prev.events,ev]};
       if(type==="bite")next.biteCount=(next.biteCount||0)+1;
-      if(type==="catch")next.catchCount=(next.catchCount||0)+1;
       return next;
     });
+  };
+
+  const handleLogCatch=({fishName,count,kept})=>{
+    if(!activeSession) return null;
+    const rec={...EMPTY_CATCH,id:uid(),tripId:activeSession.id,caughtAt:Date.now(),
+      fishName,count,kept,released:!kept,
+      handlingStatus:kept?"pending":"released",
+      createdAt:Date.now(),updatedAt:Date.now()};
+    setCatches(prev=>[rec,...prev]);
+    setActiveSession(prev=>{
+      if(!prev)return prev;
+      const ev={id:uid(),ts:Date.now(),type:"catch",note:`${fishName} ${count}匹（${kept?"持ち帰り":"リリース"}）`};
+      return {...prev,events:[...prev.events,ev],catchCount:(prev.catchCount||0)+count};
+    });
+    return rec;
+  };
+
+  const handleUpdateCatch=(id,patch)=>{
+    setCatches(prev=>prev.map(c=>c.id===id?{...c,...patch,updatedAt:Date.now()}:c));
+  };
+  const handleDeleteCatch=id=>{
+    if(!confirm("この釣果を削除しますか？"))return;
+    setCatches(prev=>prev.filter(c=>c.id!==id));
+  };
+  const handleAddCatchToTrip=(tripId,form)=>{
+    const rec={...EMPTY_CATCH,...form,id:uid(),tripId,caughtAt:Date.now(),
+      released:!form.kept,handlingStatus:form.kept?"pending":"released",
+      createdAt:Date.now(),updatedAt:Date.now()};
+    setCatches(prev=>[rec,...prev]);
   };
 
   const handleEndSession=review=>{
@@ -991,15 +1639,48 @@ function App(){
     setTrips(prev=>prev.filter(t=>t.id!==id));
   };
 
+  const handleOpenHomeMode=(tripId,label)=>{
+    setHomeModeTripId(tripId);
+    setHomeModeTripLabel(label);
+  };
+  const handleCloseHomeMode=()=>setHomeModeTripId(null);
+  const handleUpdateHomeProgress=patch=>{
+    setHomeProgress(prev=>({...prev,[homeModeTripId]:{...DEFAULT_HOME_PROGRESS,...prev[homeModeTripId],...patch}}));
+  };
+  const handleSaveMeal=mealForm=>{
+    const rec={id:uid(),tripId:homeModeTripId,...mealForm,createdAt:Date.now()};
+    setMeals(prev=>[rec,...prev]);
+    handleCloseHomeMode();
+  };
+
   return (
     <div style={{background:"#061a2e",minHeight:"100vh",color:"#d0e8f5",paddingBottom:64}}>
-      {tab==="spots"&&<SpotsTab onStartFishing={handleStartFishing}/>}
-      {tab==="today"&&<TodayFishingView activeSession={activeSession} onSwitchToSpots={()=>setTab("spots")}
-        onLogEvent={handleLogEvent} onEndSession={handleEndSession}/>}
-      {tab==="stats"&&<AnalyticsPlaceholderView tripsCount={trips.length}/>}
-      {tab==="trips"&&<TripLogView trips={trips} onUpdate={handleUpdateTrip} onDelete={handleDeleteTrip}/>}
-      {tab==="gear"&&<GearTab gearTemplates={gearTemplates} setGearTemplates={setGearTemplates} rigGuides={rigGuides}/>}
-      <BottomNav tab={tab} onChange={setTab}/>
+      {homeModeTripId?(
+        <HomeModeView tripId={homeModeTripId} tripLabel={homeModeTripLabel}
+          catches={catches.filter(c=>c.tripId===homeModeTripId&&c.kept)}
+          fishMaster={fishMaster} recipes={recipes}
+          progress={homeProgress[homeModeTripId]||DEFAULT_HOME_PROGRESS}
+          onUpdateProgress={handleUpdateHomeProgress}
+          onUpdateCatch={handleUpdateCatch}
+          onSaveMeal={handleSaveMeal}
+          onClose={handleCloseHomeMode}/>
+      ):(
+        <>
+          {tab==="spots"&&<SpotsTab onStartFishing={handleStartFishing}/>}
+          {tab==="today"&&<TodayFishingView activeSession={activeSession} catches={catches} fishMaster={fishMaster}
+            onSwitchToSpots={()=>setTab("spots")}
+            onLogEvent={handleLogEvent} onLogCatch={handleLogCatch} onUpdateCatch={handleUpdateCatch}
+            onEndSession={handleEndSession}
+            onOpenHomeMode={()=>activeSession&&handleOpenHomeMode(activeSession.id,`${activeSession.spotName||""} ${activeSession.date||""}`)}/>}
+          {tab==="stats"&&<AnalyticsPlaceholderView tripsCount={trips.length}/>}
+          {tab==="trips"&&<TripLogView trips={trips} catches={catches} fishMaster={fishMaster}
+            onUpdate={handleUpdateTrip} onDelete={handleDeleteTrip}
+            onEditCatch={handleUpdateCatch} onDeleteCatch={handleDeleteCatch} onAddCatch={handleAddCatchToTrip}
+            onOpenHomeMode={trip=>handleOpenHomeMode(trip.id,`${trip.spotName||""} ${trip.date||""}`)}/>}
+          {tab==="gear"&&<GearTab gearTemplates={gearTemplates} setGearTemplates={setGearTemplates} rigGuides={rigGuides}/>}
+        </>
+      )}
+      <BottomNav tab={tab} onChange={key=>{setHomeModeTripId(null);setTab(key);}}/>
     </div>
   );
 }
