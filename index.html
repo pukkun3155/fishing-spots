@@ -16,7 +16,7 @@ input,select,textarea,button{font-family:inherit}
 <body>
 <div id="root"></div>
 <script type="text/babel">
-const { useState, useEffect, useRef } = React;
+const { useState, useEffect, useRef, useMemo } = React;
 
 const AREA_LABEL = { numazu:"沼津", nishiizu:"西伊豆", higashiizu:"東伊豆", minamiizu:"南伊豆", nakaizu:"中伊豆", kanagawa:"神奈川", other:"その他" };
 const TYPE_LABEL = { harbor:"漁港・堤防", beach:"砂浜・サーフ", iso:"磯", pier:"桟橋・護岸", tetra:"テトラ帯" };
@@ -321,6 +321,244 @@ function getConditionStats(trips){
       .sort((a,b)=>b.total-a.total);
     return {field,label,values};
   }).filter(Boolean);
+}
+
+// ── Phase 13: 釣行判断分析（判断履歴と釣果履歴を分けて集計する。未来を当てる分析ではない） ──
+
+function filterSkipLogsByPeriod(logs,period){
+  if(period==="all") return logs;
+  const now=Date.now();
+  let from;
+  if(period==="30d") from=now-30*24*60*60*1000;
+  else if(period==="year"){ const d=new Date(); d.setMonth(0,1); d.setHours(0,0,0,0); from=d.getTime(); }
+  else return logs;
+  return logs.filter(l=>{
+    const ts=l.date?new Date(l.date+"T00:00:00").getTime():l.createdAt;
+    return ts==null?true:ts>=from;
+  });
+}
+
+// trip.windは「北東 8.82m/s」のような自由文字列のため、m/sの数値部分だけ抽出する。抽出できなければ null（＝条件不明）。
+function parseTripWindSpeed(windStr){
+  if(!windStr) return null;
+  const m=String(windStr).match(/(-?\d+(?:\.\d+)?)\s*m\/s/);
+  if(!m) return null;
+  const n=parseFloat(m[1]);
+  return isNaN(n)?null:n;
+}
+
+// 既存windSpeedLabel（Phase6）と同じ区分。表示ラベルもそこに合わせる。
+const WIND_BUCKETS=[
+  {key:"calm",label:"0〜2.9m/s",test:n=>n<3},
+  {key:"light",label:"3〜4.9m/s",test:n=>n>=3&&n<5},
+  {key:"strong",label:"5〜6.9m/s",test:n=>n>=5&&n<7},
+  {key:"warn",label:"7m/s以上",test:n=>n>=7},
+];
+function windBucketOf(n){
+  if(n==null||isNaN(n)) return null;
+  const b=WIND_BUCKETS.find(b=>b.test(n));
+  return b?b.key:null;
+}
+
+// 既存waveHeightToLabel（Phase8）と同じ3区分。tripは既にラベル文字列を保持しているのでそのまま突き合わせる。
+const WAVE_BUCKETS=[
+  {key:"calm",label:"0〜0.4m（穏やか）",match:"穏やか"},
+  {key:"mid",label:"0.5〜0.9m（やや波あり）",match:"やや波あり"},
+  {key:"high",label:"1.0m以上（高め）",match:"高め"},
+];
+
+function getDecisionBasicStats(trips,skipLogs){
+  const tripStats=getTripStats(trips);
+  return {
+    tripCount:trips.length,
+    skipCount:skipLogs.length,
+    withCatch:tripStats.withCatch,
+    bouzu:tripStats.bouzu, // 見送りはここに含めない（trips配列にはそもそも見送りは入っていない）
+  };
+}
+
+// 見送り理由の集計。同率の最多理由は無理に1つに絞らない。
+function getSkipReasonStats(skipLogs){
+  const tally=new Map();
+  skipLogs.forEach(l=>{
+    const r=l.reason||"（理由未記録）";
+    tally.set(r,(tally.get(r)||0)+1);
+  });
+  const list=[...tally.entries()].map(([reason,count])=>({reason,count})).sort((a,b)=>b.count-a.count);
+  const topCount=list[0]?.count||0;
+  const topReasons=list.filter(r=>r.count===topCount).map(r=>r.reason);
+  return { total:skipLogs.length, list, topReasons, topCount };
+}
+
+// 風速区分ごとの「釣行した回数」と「見送った回数」。条件不明は別枠に集計し、母数から消さない。
+function getDecisionByWindStats(trips,skipLogs){
+  const buckets=WIND_BUCKETS.map(b=>({key:b.key,label:b.label,tripCount:0,skipCount:0}));
+  let unknownTrip=0,unknownSkip=0;
+  trips.forEach(t=>{
+    const key=windBucketOf(parseTripWindSpeed(t.wind));
+    if(key) buckets.find(b=>b.key===key).tripCount++; else unknownTrip++;
+  });
+  skipLogs.forEach(l=>{
+    const ms=l.conditionsSnapshot?.weather?.windSpeedMs;
+    const key=windBucketOf(ms);
+    if(key) buckets.find(b=>b.key===key).skipCount++; else unknownSkip++;
+  });
+  return { buckets, unknownTrip, unknownSkip };
+}
+
+function getDecisionByWaveStats(trips,skipLogs){
+  const buckets=WAVE_BUCKETS.map(b=>({key:b.key,label:b.label,tripCount:0,skipCount:0}));
+  let unknownTrip=0,unknownSkip=0;
+  trips.forEach(t=>{
+    const b=WAVE_BUCKETS.find(b=>b.match===t.waves);
+    if(b) buckets.find(x=>x.key===b.key).tripCount++; else unknownTrip++;
+  });
+  skipLogs.forEach(l=>{
+    const wm=l.conditionsSnapshot?.weather?.waveHeightM;
+    const label=wm!=null?waveHeightToLabel(wm):null;
+    const b=WAVE_BUCKETS.find(b=>b.match===label);
+    if(b) buckets.find(x=>x.key===b.key).skipCount++; else unknownSkip++;
+  });
+  return { buckets, unknownTrip, unknownSkip };
+}
+
+// ここから先は「実際に釣行したtripだけ」を対象にする（見送りは釣果0として数えない）。
+function getOutcomeByWindStats(trips){
+  const buckets=WIND_BUCKETS.map(b=>({key:b.key,label:b.label,tripCount:0,withCatch:0}));
+  let unknown=0,unknownWithCatch=0;
+  trips.forEach(t=>{
+    const key=windBucketOf(parseTripWindSpeed(t.wind));
+    const caught=(t.catchCount||0)>0;
+    if(key){ const b=buckets.find(b=>b.key===key); b.tripCount++; if(caught) b.withCatch++; }
+    else{ unknown++; if(caught) unknownWithCatch++; }
+  });
+  return { buckets, unknown, unknownWithCatch };
+}
+
+function getOutcomeByWaveStats(trips){
+  const buckets=WAVE_BUCKETS.map(b=>({key:b.key,label:b.label,tripCount:0,withCatch:0}));
+  let unknown=0,unknownWithCatch=0;
+  trips.forEach(t=>{
+    const b=WAVE_BUCKETS.find(b=>b.match===t.waves);
+    const caught=(t.catchCount||0)>0;
+    if(b){ const e=buckets.find(x=>x.key===b.key); e.tripCount++; if(caught) e.withCatch++; }
+    else{ unknown++; if(caught) unknownWithCatch++; }
+  });
+  return { buckets, unknown, unknownWithCatch };
+}
+
+// 潮：手入力またはPhase8/9由来のtideDirectionのみ利用。大潮/中潮等は自動推定しない（既存方針を維持）。
+function getOutcomeByTideStats(trips){
+  const keys=[["上げ","上げ"],["下げ","下げ"]];
+  const buckets=keys.map(([key,label])=>({key,label,tripCount:0,withCatch:0}));
+  let unknown=0,unknownWithCatch=0;
+  trips.forEach(t=>{
+    const b=buckets.find(b=>b.key===t.tideDirection);
+    const caught=(t.catchCount||0)>0;
+    if(b){ b.tripCount++; if(caught) b.withCatch++; }
+    else{ unknown++; if(caught) unknownWithCatch++; }
+  });
+  return { buckets, unknown, unknownWithCatch };
+}
+
+function getOutcomeByWeatherStats(trips){
+  const buckets=["晴れ","曇り","雨"].map(label=>({key:label,label,tripCount:0,withCatch:0}));
+  let unknown=0,unknownWithCatch=0;
+  trips.forEach(t=>{
+    const b=buckets.find(b=>b.key===t.weather);
+    const caught=(t.catchCount||0)>0;
+    if(b){ b.tripCount++; if(caught) b.withCatch++; }
+    else{ unknown++; if(caught) unknownWithCatch++; }
+  });
+  return { buckets, unknown, unknownWithCatch };
+}
+
+// 時間帯別に「釣行・釣果」と「見送り」を並べる。見送りはconditionsSnapshot.plan.startTimeのみを使う（推測しない）。
+function getTimeOutcomeStats(trips,skipLogs){
+  const tripBuckets=getTimeStats(trips); // 既存Phase3の関数をそのまま再利用
+  const skipCounts={early:0,morning:0,midday:0,evening:0,night:0};
+  let skipUnknown=0;
+  skipLogs.forEach(l=>{
+    const st=l.conditionsSnapshot?.plan?.startTime;
+    const hh=st?parseInt(st.split(":")[0],10):NaN;
+    if(isNaN(hh)){ skipUnknown++; return; }
+    skipCounts[timeBucketOf(hh)]++;
+  });
+  return tripBuckets.map(b=>({...b,skipCount:skipCounts[b.key]||0}));
+}
+
+// スポット別：trip統計（既存getSpotStats）に、skip logのplannedSpotId（確実なFK）で見送りを付加する。
+function getSpotOutcomeStats(trips,skipLogs,spots){
+  const map=new Map();
+  const ensure=(key,label)=>{ if(!map.has(key)) map.set(key,{key,label,trips:[],skips:[]}); return map.get(key); };
+  trips.forEach(t=>{
+    const key=t.spotId||("name:"+(t.spotName||"不明"));
+    ensure(key,t.spotName||"（スポット不明）").trips.push(t);
+  });
+  skipLogs.forEach(l=>{
+    if(!l.plannedSpotId) return;
+    const spot=(spots||[]).find(s=>s.id===l.plannedSpotId);
+    const label=spot?spot.name:(l.conditionsSnapshot?.plan?.spotName||"（スポット不明）");
+    ensure(l.plannedSpotId,label).skips.push(l);
+  });
+  return [...map.values()].map(({key,label,trips:tlist,skips})=>{
+    const reasonStats=getSkipReasonStats(skips);
+    return { key, label, ...getTripStats(tlist), skipCount:skips.length,
+      topSkipReasons:reasonStats.topReasons, topSkipCount:reasonStats.topCount };
+  }).sort((a,b)=>(b.total+b.skipCount)-(a.total+a.skipCount));
+}
+
+// 狙い魚別：tripIdでcatchと確実に結合し、「狙い魚と同じ魚が釣れた」「別の魚が釣れた」「釣果なし」を分ける。
+// skipLogsのplannedFishはtripとは別枠の集計であり、個々のtripへは結びつけない。
+function getTargetOutcomeStats(trips,catches,skipLogs){
+  const map=new Map();
+  trips.forEach(t=>{
+    const key=t.targetFish||"（未設定）";
+    if(!map.has(key)) map.set(key,[]);
+    map.get(key).push(t);
+  });
+  const skipTally=new Map();
+  skipLogs.forEach(l=>{
+    const key=l.plannedFish||"（未設定）";
+    skipTally.set(key,(skipTally.get(key)||0)+1);
+  });
+  return [...map.entries()].map(([targetFish,tlist])=>{
+    const tripIds=new Set(tlist.map(t=>t.id));
+    const related=catches.filter(c=>tripIds.has(c.tripId));
+    const matchTripIds=new Set(related.filter(c=>c.fishName===targetFish).map(c=>c.tripId));
+    const otherTripIds=new Set(related.filter(c=>c.fishName!==targetFish&&!matchTripIds.has(c.tripId)).map(c=>c.tripId));
+    const totalMatchCount=related.filter(c=>c.fishName===targetFish).reduce((s,c)=>s+(c.count||0),0);
+    return {
+      targetFish, tripCount:tlist.length,
+      matchCatchTripCount:matchTripIds.size,
+      otherCatchTripCount:otherTripIds.size,
+      noCatchTripCount:tlist.length-matchTripIds.size-otherTripIds.size,
+      totalMatchCount,
+      skipCount:skipTally.get(targetFish)||0,
+    };
+  }).sort((a,b)=>b.tripCount-a.tripCount);
+}
+
+// 個人の判断傾向サマリー。n>=3の項目だけを事実文として採用する（推測・断定文は作らない）。
+function getPersonalDecisionInsights({timeOutcome,windDecision,skipReasons}){
+  const lines=[];
+  const bestTime=timeOutcome.filter(t=>t.total>=3).sort((a,b)=>b.total-a.total)[0];
+  if(bestTime) lines.push(`記録上、${bestTime.label}は${bestTime.total}回中${bestTime.withCatch}回で釣果がありました`);
+
+  const warnBucket=windDecision.buckets.find(b=>b.key==="warn"||b.key==="strong");
+  if(warnBucket){
+    const denom=warnBucket.tripCount+warnBucket.skipCount;
+    if(denom>=3) lines.push(`${warnBucket.label}では${denom}回中${warnBucket.skipCount}回見送っています`);
+  }
+
+  if(skipReasons.total>=3){
+    if(skipReasons.topReasons.length===1){
+      lines.push(`見送り理由は${skipReasons.topReasons[0]}が最多です（${skipReasons.topCount}回）`);
+    }else if(skipReasons.topReasons.length>1){
+      lines.push(`見送り理由は${skipReasons.topReasons.join("・")}が各${skipReasons.topCount}回で並んでいます`);
+    }
+  }
+  return lines.slice(0,3);
 }
 
 // ── Phase 4: 最新周辺釣果 × 自分の実績 の「今おすすめの狙い」 ──
@@ -3759,16 +3997,205 @@ function ConditionStatsSection({conditionStats}){
   );
 }
 
-function AnalyticsView({trips,catches}){
-  const [period,setPeriod]=useState(()=>loadStore(ANALYTICS_KEY,{schemaVersion:1,period:"all"}).period);
-  useEffect(()=>{ saveStore(ANALYTICS_KEY,{schemaVersion:1,period}); },[period]);
+function DecisionBucketRow({label,tripCount,skipCount}){
+  const total=tripCount+skipCount;
+  return (
+    <div style={{background:"rgba(255,255,255,0.05)",borderRadius:8,padding:"7px 10px",marginBottom:6}}>
+      <div style={{display:"flex",justifyContent:"space-between",fontSize:12,color:"#d0e8f5"}}>
+        <span>{label}</span><span>{total>0?`計${total}回`:"記録なし"}</span>
+      </div>
+      {total>0&&<div style={{fontSize:11,color:"#6a9bb8",marginTop:3}}>釣行 {tripCount}回・見送り {skipCount}回</div>}
+    </div>
+  );
+}
 
-  if(trips.length===0){
+function DecisionBucketSection({buckets,unknownTrip,unknownSkip}){
+  return (
+    <div style={{marginBottom:6}}>
+      {buckets.map(b=><DecisionBucketRow key={b.key} label={b.label} tripCount={b.tripCount} skipCount={b.skipCount}/>)}
+      {(unknownTrip>0||unknownSkip>0)&&
+        <DecisionBucketRow label="条件不明" tripCount={unknownTrip} skipCount={unknownSkip}/>}
+    </div>
+  );
+}
+
+function OutcomeBucketRow({label,tripCount,withCatch}){
+  return (
+    <div style={{background:"rgba(255,255,255,0.05)",borderRadius:8,padding:"7px 10px",marginBottom:6}}>
+      <div style={{display:"flex",justifyContent:"space-between",fontSize:12,color:"#d0e8f5"}}>
+        <span>{label}</span><span>{tripCount>0?`${tripCount}回`:"記録なし"}</span>
+      </div>
+      {tripCount>0&&(<>
+        <Bar value={withCatch} max={tripCount} color="#2ecc87"/>
+        <div style={{fontSize:10,color:"#6a9bb8",marginTop:3}}><RateBadge num={withCatch} den={tripCount}/></div>
+      </>)}
+    </div>
+  );
+}
+
+function OutcomeBucketSection({buckets,unknown,unknownWithCatch}){
+  return (
+    <div style={{marginBottom:6}}>
+      <div style={{fontSize:10,color:"#6a9bb8",marginBottom:6}}>※見送りは含みません</div>
+      {buckets.map(b=><OutcomeBucketRow key={b.key} label={b.label} tripCount={b.tripCount} withCatch={b.withCatch}/>)}
+      {unknown>0&&<OutcomeBucketRow label="条件不明" tripCount={unknown} withCatch={unknownWithCatch}/>}
+    </div>
+  );
+}
+
+function DecisionAnalysisView({trips,catches,skipLogs,spots}){
+  const decisionBasic=useMemo(()=>getDecisionBasicStats(trips,skipLogs),[trips,skipLogs]);
+  const skipReasons=useMemo(()=>getSkipReasonStats(skipLogs),[skipLogs]);
+  const windDecision=useMemo(()=>getDecisionByWindStats(trips,skipLogs),[trips,skipLogs]);
+  const waveDecision=useMemo(()=>getDecisionByWaveStats(trips,skipLogs),[trips,skipLogs]);
+  const windOutcome=useMemo(()=>getOutcomeByWindStats(trips),[trips]);
+  const waveOutcome=useMemo(()=>getOutcomeByWaveStats(trips),[trips]);
+  const tideOutcome=useMemo(()=>getOutcomeByTideStats(trips),[trips]);
+  const weatherOutcome=useMemo(()=>getOutcomeByWeatherStats(trips),[trips]);
+  const timeOutcome=useMemo(()=>getTimeOutcomeStats(trips,skipLogs),[trips,skipLogs]);
+  const spotOutcome=useMemo(()=>getSpotOutcomeStats(trips,skipLogs,spots),[trips,skipLogs,spots]);
+  const targetOutcome=useMemo(()=>getTargetOutcomeStats(trips,catches,skipLogs),[trips,catches,skipLogs]);
+  const insights=useMemo(()=>getPersonalDecisionInsights({timeOutcome,windDecision,skipReasons}),[timeOutcome,windDecision,skipReasons]);
+
+  return (
+    <div>
+      {insights.length>0&&(
+        <div style={{background:"rgba(122,179,255,0.1)",border:"1px solid rgba(122,179,255,0.3)",borderRadius:10,padding:"10px 12px",marginBottom:12}}>
+          <div style={{fontSize:12,color:"#7ab3ff",fontWeight:700,marginBottom:4}}>個人の判断傾向（事実のみ）</div>
+          {insights.map((line,i)=><div key={i} style={{fontSize:12,color:"#d0e8f5",lineHeight:1.7}}>・{line}</div>)}
+        </div>
+      )}
+
+      <div style={{fontSize:11,color:"#f5a623",background:"rgba(245,166,35,0.1)",border:"1px solid rgba(245,166,35,0.3)",
+        borderRadius:8,padding:"8px 10px",marginBottom:14,lineHeight:1.6}}>
+        ⚠ 見送りは釣果0回として計算していません。判断（行った／見送った）と釣果（行った上で釣れたか）は別々に集計しています。
+      </div>
+
+      <SectionTitle title="🧭 基本指標"/>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:6}}>
+        <StatCard label="釣行した回数" value={`${decisionBasic.tripCount}回`}/>
+        <StatCard label="見送った回数" value={`${decisionBasic.skipCount}回`}/>
+        <StatCard label="釣果あり" value={`${decisionBasic.withCatch}回`}/>
+        <StatCard label="ボウズ" value={`${decisionBasic.bouzu}回`}/>
+      </div>
+      <div style={{fontSize:11,color:"#6a9bb8",marginBottom:6}}>※朝チェックは直近1件のみ保存する仕様のため、利用回数の履歴は集計できません。</div>
+
+      <SectionTitle title="🚦 行動内訳"/>
+      <div style={{background:"rgba(255,255,255,0.05)",borderRadius:8,padding:"7px 10px",marginBottom:6}}>
+        <div style={{fontSize:12,color:"#d0e8f5"}}>釣行：{decisionBasic.tripCount}回　見送り：{decisionBasic.skipCount}回</div>
+        <div style={{fontSize:10,color:"#6a9bb8",marginTop:3}}>
+          ※「予定通り」「時間変更」「別候補へ変更」は既存データからは区別できないため、まとめて「釣行」の記録なしとして扱っています。
+        </div>
+      </div>
+
+      <SectionTitle title="📝 見送り理由"/>
+      {skipReasons.total===0?(
+        <EmptyNote text="見送りの記録がまだありません。"/>
+      ):(
+        <div style={{background:"rgba(255,255,255,0.05)",borderRadius:8,padding:"9px 12px",marginBottom:6}}>
+          <div style={{fontSize:11,color:"#6a9bb8",marginBottom:4}}>見送り{skipReasons.total}回中</div>
+          {skipReasons.list.map(r=>(
+            <div key={r.reason} style={{fontSize:12,color:"#d0e8f5",display:"flex",justifyContent:"space-between",marginBottom:2}}>
+              <span>{r.reason}</span><span>{r.count}回</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <SectionTitle title="🌬 風と判断"/>
+      <DecisionBucketSection buckets={windDecision.buckets} unknownTrip={windDecision.unknownTrip} unknownSkip={windDecision.unknownSkip}/>
+
+      <SectionTitle title="🌊 波と判断"/>
+      <DecisionBucketSection buckets={waveDecision.buckets} unknownTrip={waveDecision.unknownTrip} unknownSkip={waveDecision.unknownSkip}/>
+
+      <SectionTitle title="🎣 風と釣果"/>
+      <OutcomeBucketSection buckets={windOutcome.buckets} unknown={windOutcome.unknown} unknownWithCatch={windOutcome.unknownWithCatch}/>
+
+      <SectionTitle title="🎣 波と釣果"/>
+      <OutcomeBucketSection buckets={waveOutcome.buckets} unknown={waveOutcome.unknown} unknownWithCatch={waveOutcome.unknownWithCatch}/>
+
+      <SectionTitle title="🎣 潮の動きと釣果"/>
+      {(tideOutcome.buckets.every(b=>b.tripCount===0)&&tideOutcome.unknown===0)?(
+        <EmptyNote text="潮の動きが記録された釣行がまだありません。"/>
+      ):(
+        <OutcomeBucketSection buckets={tideOutcome.buckets} unknown={tideOutcome.unknown} unknownWithCatch={tideOutcome.unknownWithCatch}/>
+      )}
+
+      <SectionTitle title="🎣 天気と釣果"/>
+      <OutcomeBucketSection buckets={weatherOutcome.buckets} unknown={weatherOutcome.unknown} unknownWithCatch={weatherOutcome.unknownWithCatch}/>
+
+      <SectionTitle title="🕐 時間帯別（釣行・見送り）"/>
+      <div style={{display:"flex",flexDirection:"column",gap:8}}>
+        {timeOutcome.map(t=>(
+          <div key={t.key} style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:10,padding:"10px 12px"}}>
+            <div style={{display:"flex",justifyContent:"space-between"}}>
+              <span style={{fontSize:13,fontWeight:700,color:"#fff"}}>{t.label}</span>
+              <span style={{fontSize:12,color:"#6a9bb8"}}>{t.total>0?`釣行${t.total}回`:"記録なし"}{t.skipCount>0&&`・見送り${t.skipCount}回`}</span>
+            </div>
+            {t.total>0&&(<>
+              <Bar value={t.withCatch} max={t.total} color="#f5a623"/>
+              <div style={{fontSize:11,color:"#6a9bb8",marginTop:4}}>
+                {t.total}回中{t.withCatch}回釣果あり　<RateBadge num={t.withCatch} den={t.total}/>
+              </div>
+            </>)}
+          </div>
+        ))}
+      </div>
+
+      <SectionTitle title="📍 ポイント別"/>
+      {spotOutcome.length===0?(
+        <EmptyNote text="まだ釣行・見送りの記録がありません。"/>
+      ):(
+        <div style={{display:"flex",flexDirection:"column",gap:8}}>
+          {spotOutcome.map(s=>(
+            <div key={s.key} style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:10,padding:"10px 12px"}}>
+              <div style={{fontSize:14,fontWeight:700,color:"#fff"}}>{s.label}</div>
+              <div style={{fontSize:11,color:"#6a9bb8",marginTop:4}}>
+                釣行{s.total}回・釣果あり{s.withCatch}回・ボウズ{s.bouzu}回・見送り{s.skipCount}回
+              </div>
+              {s.topSkipCount>0&&<div style={{fontSize:11,color:"#d0e8f5",marginTop:2}}>主な見送り理由：{s.topSkipReasons.join("・")}（{s.topSkipCount}回）</div>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <SectionTitle title="🎯 狙い魚別"/>
+      {targetOutcome.length===0?(
+        <EmptyNote text="まだ釣行の記録がありません。"/>
+      ):(
+        <div style={{display:"flex",flexDirection:"column",gap:8}}>
+          {targetOutcome.map(t=>(
+            <div key={t.targetFish} style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:10,padding:"10px 12px"}}>
+              <div style={{fontSize:14,fontWeight:700,color:"#fff"}}>{t.targetFish}</div>
+              <div style={{fontSize:11,color:"#6a9bb8",marginTop:4}}>
+                釣行{t.tripCount}回・見送り{t.skipCount}回
+              </div>
+              <div style={{fontSize:11,color:"#d0e8f5",marginTop:2}}>
+                同じ魚種が釣れた：{t.matchCatchTripCount}回（計{t.totalMatchCount}匹）
+                {t.otherCatchTripCount>0&&<>・別の魚種：{t.otherCatchTripCount}回</>}
+                ・釣果なし：{t.noCatchTripCount}回
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AnalyticsView({trips,catches,skipLogs,spots}){
+  const stored=loadStore(ANALYTICS_KEY,{schemaVersion:1,period:"all",tab:"outcome"});
+  const [period,setPeriod]=useState(()=>stored.period||"all");
+  const [tab,setTab]=useState(()=>stored.tab||"outcome");
+  useEffect(()=>{ saveStore(ANALYTICS_KEY,{schemaVersion:1,period,tab}); },[period,tab]);
+
+  const hasAnyData=trips.length>0||(skipLogs&&skipLogs.length>0);
+  if(!hasAnyData){
     return (
       <div style={{padding:"48px 20px",textAlign:"center",color:"#6a9bb8",fontSize:13,lineHeight:2}}>
         <div style={{fontSize:38,marginBottom:10}}>📊</div>
-        まだ統計を表示できる釣行記録がありません。<br/>
-        実際の釣行を記録すると、ここに傾向が表示されます。
+        まだ釣行・見送りのデータがありません。<br/>
+        実際の釣行や見送りを記録すると、ここに傾向が表示されます。
       </div>
     );
   }
@@ -3776,11 +4203,28 @@ function AnalyticsView({trips,catches}){
   const filteredTrips=filterTripsByPeriod(trips,period);
   const filteredTripIds=new Set(filteredTrips.map(t=>t.id));
   const filteredCatches=catches.filter(c=>filteredTripIds.has(c.tripId));
+  const filteredSkipLogs=filterSkipLogsByPeriod(skipLogs||[],period);
   const periodChips=[["all","全期間"],["30d","直近30日"],["year","今年"]];
 
   return (
     <div style={{padding:"12px 14px",paddingBottom:80}}>
       <div style={{fontSize:16,fontWeight:700,color:"#fff",marginBottom:10}}>📊 分析</div>
+      <div style={{display:"flex",gap:6,marginBottom:10}}>
+        <button onClick={()=>setTab("outcome")}
+          style={{flex:1,background:tab==="outcome"?"#0d3a5c":"rgba(255,255,255,0.06)",
+            border:`1px solid ${tab==="outcome"?"#f5a623":"rgba(255,255,255,0.1)"}`,
+            color:tab==="outcome"?"#f5a623":"#6a9bb8",fontWeight:tab==="outcome"?700:400,
+            borderRadius:10,padding:"8px 10px",fontSize:12,cursor:"pointer"}}>
+          📊 釣果分析
+        </button>
+        <button onClick={()=>setTab("decision")}
+          style={{flex:1,background:tab==="decision"?"#0d3a5c":"rgba(255,255,255,0.06)",
+            border:`1px solid ${tab==="decision"?"#f5a623":"rgba(255,255,255,0.1)"}`,
+            color:tab==="decision"?"#f5a623":"#6a9bb8",fontWeight:tab==="decision"?700:400,
+            borderRadius:10,padding:"8px 10px",fontSize:12,cursor:"pointer"}}>
+          🧭 判断分析
+        </button>
+      </div>
       <div style={{display:"flex",gap:6,marginBottom:14}}>
         {periodChips.map(([k,l])=>(
           <button key={k} onClick={()=>setPeriod(k)}
@@ -3793,24 +4237,28 @@ function AnalyticsView({trips,catches}){
         ))}
       </div>
 
-      {filteredTrips.length===0?(
-        <div style={{textAlign:"center",padding:"32px 16px",color:"#6a9bb8",fontSize:13,lineHeight:1.8}}>
-          この期間の釣行記録がありません。
-        </div>
+      {tab==="outcome"?(
+        filteredTrips.length===0?(
+          <div style={{textAlign:"center",padding:"32px 16px",color:"#6a9bb8",fontSize:13,lineHeight:1.8}}>
+            この期間の釣行記録がありません。
+          </div>
+        ):(
+          <>
+            <BasicDashboard stats={getTripStats(filteredTrips)}/>
+            <SectionTitle title="🐟 魚種別"/>
+            <FishStatsSection fishStats={getFishStats(filteredCatches)}/>
+            <SectionTitle title="📍 ポイント別"/>
+            <SpotStatsSection spotStats={getSpotStats(filteredTrips)}/>
+            <SectionTitle title="🕐 時間帯別"/>
+            <TimeStatsSection timeStats={getTimeStats(filteredTrips)}/>
+            <SectionTitle title="📅 月別"/>
+            <MonthlyStatsSection monthlyStats={getMonthlyStats(filteredTrips,filteredCatches)}/>
+            <SectionTitle title="🎯 条件別"/>
+            <ConditionStatsSection conditionStats={getConditionStats(filteredTrips)}/>
+          </>
+        )
       ):(
-        <>
-          <BasicDashboard stats={getTripStats(filteredTrips)}/>
-          <SectionTitle title="🐟 魚種別"/>
-          <FishStatsSection fishStats={getFishStats(filteredCatches)}/>
-          <SectionTitle title="📍 ポイント別"/>
-          <SpotStatsSection spotStats={getSpotStats(filteredTrips)}/>
-          <SectionTitle title="🕐 時間帯別"/>
-          <TimeStatsSection timeStats={getTimeStats(filteredTrips)}/>
-          <SectionTitle title="📅 月別"/>
-          <MonthlyStatsSection monthlyStats={getMonthlyStats(filteredTrips,filteredCatches)}/>
-          <SectionTitle title="🎯 条件別"/>
-          <ConditionStatsSection conditionStats={getConditionStats(filteredTrips)}/>
-        </>
+        <DecisionAnalysisView trips={filteredTrips} catches={filteredCatches} skipLogs={filteredSkipLogs} spots={spots||[]}/>
       )}
     </div>
   );
@@ -4854,7 +5302,7 @@ function App(){
             onLogEvent={handleLogEvent} onLogCatch={handleLogCatch} onUpdateCatch={handleUpdateCatch}
             onEndSession={handleEndSession}
             onOpenHomeMode={()=>activeSession&&handleOpenHomeMode(activeSession.id,`${activeSession.spotName||""} ${activeSession.date||""}`)}/>}
-          {tab==="stats"&&<AnalyticsView trips={trips} catches={catches}/>}
+          {tab==="stats"&&<AnalyticsView trips={trips} catches={catches} skipLogs={currentSkipLogs} spots={currentSpots}/>}
           {tab==="trips"&&<TripLogView trips={trips} catches={catches} fishMaster={fishMaster}
             onUpdate={handleUpdateTrip} onDelete={handleDeleteTrip}
             onEditCatch={handleUpdateCatch} onDeleteCatch={handleDeleteCatch} onAddCatch={handleAddCatchToTrip}
