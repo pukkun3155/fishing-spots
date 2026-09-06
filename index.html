@@ -452,7 +452,7 @@ function bestSpotForFish({fishName,trips,catches,spots}){
   return tagged||null;
 }
 
-function getTargetRecommendations({trips,catches,reports,targetProfiles,gearProfile,spots,todayConditions,now}){
+function getTargetRecommendations({trips,catches,reports,targetProfiles,gearProfile,spots,todayConditions,now,includeIneligible}){
   now=now||Date.now();
   const shoreReports=reports.filter(r=>r.fishingType==="shore");
   const boatReports=reports.filter(r=>r.fishingType==="boat");
@@ -548,12 +548,87 @@ function getTargetRecommendations({trips,catches,reports,targetProfiles,gearProf
     const eligible=shoreDays!=null||!!latestBoat||personalTripCount>0;
     const matchedSpot=bestSpotForFish({fishName,trips,catches,spots});
 
-    return { fishName, score, stars, reasons, cautions, eligible, matchedSpot,
+    return { fishName, score, stars, reasons, cautions, eligible, matchedSpot, bestMethod:fitMethod,
       latestShore, latestBoat, shoreDays, shoreFreshness:freshnessLabel(shoreDays),
       personalTripCount, personalCount, gearFit:!fitMethod&&methods.length>0?false:true };
   });
 
-  return scored.filter(s=>s.eligible).sort((a,b)=>b.score-a.score);
+  const sorted=scored.sort((a,b)=>b.score-a.score);
+  return includeIneligible?sorted:sorted.filter(s=>s.eligible);
+}
+
+// ── Phase 7: 釣行前ブリーフィング ──
+
+const SKIP_LOGS_KEY = "fishing_skip_logs_v1";
+const SKIP_REASON_OPTIONS = ["強風","高波","雨","時間不足","準備不足","気分","その他"];
+const IMPORTANT_GEAR_LABELS = ["仕掛け","予備仕掛け","オモリ","エサ","ハサミ","タオル","ウェットティッシュ","ゴミ袋","手洗い用の水","クーラーボックス","保冷剤または氷"];
+
+function computePlannedEndTime(startTime,durationMin){
+  if(!startTime||!durationMin) return null;
+  const [h,m]=startTime.split(":").map(Number);
+  const dur=parseInt(durationMin,10);
+  if(isNaN(h)||isNaN(m)||isNaN(dur)) return null;
+  const totalMin=h*60+m+dur;
+  const crossesDay=totalMin>=24*60;
+  const norm=((totalMin%(24*60))+24*60)%(24*60);
+  const endH=Math.floor(norm/60), endM=norm%60;
+  return { text:`${String(endH).padStart(2,"0")}:${String(endM).padStart(2,"0")}${crossesDay?"（翌日）":""}`, crossesDay };
+}
+
+function getBriefingReportStats(reports,fishName,now){
+  const fishReports=reports.filter(r=>r.fishName===fishName);
+  const within7=fishReports.filter(r=>(daysAgo(r.reportedAt,now)||999)<=7).length;
+  const within30=fishReports.filter(r=>(daysAgo(r.reportedAt,now)||999)<=30).length;
+  const shoreCount=fishReports.filter(r=>r.fishingType==="shore").length;
+  const boatCount=fishReports.filter(r=>r.fishingType==="boat").length;
+  const sorted=[...fishReports].sort((a,b)=>new Date(b.reportedAt)-new Date(a.reportedAt));
+  const latest=sorted[0]||null;
+  const lastDays=latest?daysAgo(latest.reportedAt,now):null;
+  return { total:fishReports.length, within7, within30, shoreCount, boatCount, lastDays };
+}
+
+function getBriefingPersonalStats({trips,catches,fishName,matchedSpot,todayConditions,now}){
+  const triedTripIds=new Set(trips.filter(t=>t.targetFish===fishName).map(t=>t.id));
+  catches.filter(c=>c.fishName===fishName).forEach(c=>triedTripIds.add(c.tripId));
+  const relevant=trips.filter(t=>triedTripIds.has(t.id));
+  const overall=getTripStats(relevant);
+
+  let bucket=timeBucketOf(new Date(now).getHours());
+  if(todayConditions&&todayConditions.plannedStartTime){
+    const hh=parseInt(todayConditions.plannedStartTime.split(":")[0],10);
+    if(!isNaN(hh)) bucket=timeBucketOf(hh);
+  }
+  const timeStat=timeBucketMatchForFish({trips,catches,fishName,bucket});
+
+  let spotStat=null;
+  if(matchedSpot){
+    const spotTrips=relevant.filter(t=>t.spotId===matchedSpot.id);
+    if(spotTrips.length>0) spotStat=getTripStats(spotTrips);
+  }
+
+  return { overall, bucket, timeStat, spotStat, tripCount:relevant.length };
+}
+
+function getOverallVerdict({recommendations,safetyNotices}){
+  if(safetyNotices&&safetyNotices.length>0){
+    return { level:"D", label:"⚠ 条件に注意", summary:"風または波の条件に注意が必要です。安全を優先して判断してください。" };
+  }
+  if(!recommendations||recommendations.length===0){
+    return { level:"E", label:"？ 判断材料不足", summary:"判断材料が不足しています。今日の条件や釣行記録を追加すると、より具体的なブリーフィングができます。" };
+  }
+  const top=recommendations[0];
+  const hasRealEvidence=top.personalTripCount>=3||(top.shoreDays!=null&&top.shoreDays<=30);
+  if(top.stars>=4&&hasRealEvidence){
+    return { level:"A", label:"◎ 有力候補あり",
+      summary:`${top.fishName}が有力候補です。${top.matchedSpot?top.matchedSpot.name+"での":""}短時間の岸釣りに向いています。` };
+  }
+  if(top.stars>=3){
+    return { level:"B", label:"○ 候補あり", summary:`${top.fishName}が候補に挙がっています。` };
+  }
+  if(top.personalTripCount===0&&top.shoreDays==null){
+    return { level:"C", label:"△ 参考程度", summary:"最新の周辺情報・自分の実績とも少なめのため、参考程度の候補です。" };
+  }
+  return { level:"C", label:"△ 参考程度", summary:"データが少なめのため参考程度の候補です。" };
 }
 
 const EMPTY = {
@@ -1310,8 +1385,7 @@ function ReportsListView({reports}){
   );
 }
 
-function TodayConditionsCard({conditions,onSave,onReset}){
-  const [expanded,setExpanded]=useState(false);
+function TodayConditionsCard({conditions,onSave,onReset,expanded,onToggleExpanded}){
   const today=new Date().toISOString().slice(0,10);
   const isStale=!!(conditions.date&&conditions.date!==today);
   const current=isStale?EMPTY_TODAY_CONDITIONS:conditions;
@@ -1334,7 +1408,7 @@ function TodayConditionsCard({conditions,onSave,onReset}){
     <div style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:12,padding:"12px 14px",marginBottom:14}}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
         <span style={{fontSize:14,fontWeight:700,color:"#fff"}}>☀️ 今日の条件</span>
-        <button onClick={()=>setExpanded(v=>!v)}
+        <button onClick={onToggleExpanded}
           style={{fontSize:11,padding:"4px 10px",borderRadius:8,border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#6a9bb8",cursor:"pointer"}}>
           {expanded?"閉じる":hasAny?"編集":"入力する"}
         </button>
@@ -1404,57 +1478,347 @@ function TodayConditionsCard({conditions,onSave,onReset}){
   );
 }
 
-function TodayFishingView({activeSession,catches,fishMaster,recommendations,reports,reportsError,reportsMalformed,reportsUpdatedAt,todayConditions,onSaveTodayConditions,onResetTodayConditions,onStartFishingAt,onSwitchToSpots,onLogEvent,onLogCatch,onUpdateCatch,onEndSession,onOpenHomeMode}){
+function SkipLogModal({show,onClose,onSave,snapshot}){
+  const [reason,setReason]=useState("");
+  const [note,setNote]=useState("");
+  useEffect(()=>{ if(show){ setReason(""); setNote(""); } },[show]);
+  return (
+    <Modal show={show} onClose={onClose}>
+      <h2 style={{fontSize:16,fontWeight:700,color:"#fff",marginBottom:16}}>今日は見送る</h2>
+      <div style={{fontSize:12,color:"#6a9bb8",marginBottom:12}}>
+        {snapshot.fishName?`予定：${snapshot.fishName}${snapshot.spotName?" × "+snapshot.spotName:""}`:"予定は特に設定されていません"}
+      </div>
+      <Field label="理由（任意）">
+        <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+          {SKIP_REASON_OPTIONS.map(r=>(
+            <button key={r} onClick={()=>setReason(r===reason?"":r)}
+              style={{padding:"7px 12px",borderRadius:20,fontSize:12,cursor:"pointer",
+                background:reason===r?"#0d3a5c":"rgba(255,255,255,0.06)",
+                border:`1px solid ${reason===r?"#f5a623":"rgba(255,255,255,0.1)"}`,
+                color:reason===r?"#f5a623":"#6a9bb8",fontWeight:reason===r?700:400}}>
+              {r}
+            </button>
+          ))}
+        </div>
+      </Field>
+      <Field label="メモ（任意）"><Textarea value={note} onChange={e=>setNote(e.target.value)}/></Field>
+      <div style={{display:"flex",gap:8,marginTop:18}}>
+        <button onClick={onClose}
+          style={{background:"transparent",border:"1px solid rgba(255,255,255,0.15)",color:"#6a9bb8",borderRadius:10,padding:"12px 16px",fontSize:14,cursor:"pointer"}}>
+          キャンセル
+        </button>
+        <button onClick={()=>onSave({reason,note})}
+          style={{flex:1,background:"#f5a623",color:"#1a0a00",border:"none",borderRadius:10,padding:12,fontSize:15,fontWeight:700,cursor:"pointer"}}>
+          記録して閉じる
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+function BriefingView({recommendations,trips,catches,reports,targetProfiles,gearProfile,spots,gearTemplates,
+  todayConditions,reportsUpdatedAt,reportsError,reportsMalformed,onStartFishingAt,onOpenConditions,onSaveSkipLog}){
+  const [overrideFishName,setOverrideFishName]=useState(null);
+  const [overrideSpotId,setOverrideSpotId]=useState(null);
+  const [showFishPicker,setShowFishPicker]=useState(false);
+  const [showSpotPicker,setShowSpotPicker]=useState(false);
+  const [showOthersDetail,setShowOthersDetail]=useState({});
+  const [showSkip,setShowSkip]=useState(false);
+
+  const now=Date.now();
+  const todayStr=new Date().toISOString().slice(0,10);
+  const effectiveConditions=todayConditions&&todayConditions.date===todayStr?todayConditions:null;
+  const safetyNotices=getTodaySafetyNotices(effectiveConditions);
+  const verdict=getOverallVerdict({recommendations,safetyNotices});
+
+  const allCandidates=getTargetRecommendations({trips,catches,reports,targetProfiles,gearProfile,spots,
+    todayConditions:effectiveConditions,now,includeIneligible:true});
+
+  const topBase=recommendations[0]||null;
+  const effectiveFishName=overrideFishName||(topBase?topBase.fishName:null);
+  let effective=effectiveFishName?allCandidates.find(c=>c.fishName===effectiveFishName):null;
+  if(effective&&overrideSpotId){
+    const overrideSpot=spots.find(s=>s.id===overrideSpotId)||null;
+    effective={...effective,matchedSpot:overrideSpot};
+  }
+  const others=recommendations.filter(r=>r.fishName!==effectiveFishName).slice(0,2);
+
+  const reportStats=effective?getBriefingReportStats(reports,effective.fishName,now):null;
+  const personalStats=effective?getBriefingPersonalStats({trips,catches,fishName:effective.fishName,matchedSpot:effective.matchedSpot,todayConditions:effectiveConditions,now}):null;
+  const plannedEnd=effectiveConditions?computePlannedEndTime(effectiveConditions.plannedStartTime,effectiveConditions.plannedDurationMin):null;
+  const updateStatus=reportsUpdateStatus(reportsUpdatedAt,now);
+
+  const gearTemplate=gearTemplates[0]||null;
+  const checkedCount=gearTemplate?gearTemplate.items.filter(i=>i.checked).length:0;
+  const totalCount=gearTemplate?gearTemplate.items.length:0;
+  const uncheckedImportant=gearTemplate?gearTemplate.items.filter(i=>!i.checked&&IMPORTANT_GEAR_LABELS.includes(i.label)).slice(0,5):[];
+  const prepReady=uncheckedImportant.length===0;
+
+  const profile=effective?targetProfiles.find(p=>p.fishName===effective.fishName):null;
+  const methods=profile?.recommendedMethods||[];
+  const shownMethod=effective?(effective.bestMethod||methods[0]||null):null;
+
+  const conditionsSummary=[];
+  if(effectiveConditions){
+    if(effectiveConditions.weather) conditionsSummary.push(effectiveConditions.weather);
+    if(effectiveConditions.temperatureC) conditionsSummary.push(`${effectiveConditions.temperatureC}℃`);
+    if(effectiveConditions.windDirection||effectiveConditions.windSpeedMs)
+      conditionsSummary.push(`${effectiveConditions.windDirection||""} ${effectiveConditions.windSpeedMs?effectiveConditions.windSpeedMs+"m/s":""}`.trim());
+    if(effectiveConditions.tideType||effectiveConditions.tideDirection)
+      conditionsSummary.push(`${effectiveConditions.tideType||""}${effectiveConditions.tideDirection?"・"+effectiveConditions.tideDirection:""}`);
+    if(effectiveConditions.wave) conditionsSummary.push(`波 ${effectiveConditions.wave}`);
+    if(effectiveConditions.turbidity) conditionsSummary.push(effectiveConditions.turbidity);
+  }
+
+  const verdictColor={A:"#2ecc87",B:"#7ab3ff",C:"#6a9bb8",D:"#e84c3d",E:"#6a9bb8"}[verdict.level];
+  const fishPickerOptions=targetProfiles.map(p=>p.fishName);
+  const skipSnapshot={fishName:effective?effective.fishName:"",spotName:effective?.matchedSpot?.name||""};
+
+  return (
+    <div style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.12)",borderRadius:14,padding:"14px 14px 16px",marginBottom:16}}>
+      <div style={{fontSize:16,fontWeight:700,color:"#fff",marginBottom:10}}>📋 釣行前ブリーフィング</div>
+
+      {/* 1. 総合判断 */}
+      <div style={{background:`rgba(255,255,255,0.05)`,border:`1px solid ${verdictColor}55`,borderRadius:10,padding:"10px 12px",marginBottom:12}}>
+        <div style={{fontSize:15,fontWeight:700,color:verdictColor}}>{verdict.label}</div>
+        <div style={{fontSize:12,color:"#d0e8f5",marginTop:4,lineHeight:1.6}}>{verdict.summary}</div>
+      </div>
+
+      {effective?(
+        <>
+          {/* 2. 第1候補 */}
+          <div style={{marginBottom:4}}>
+            <div style={{fontSize:11,color:"#6a9bb8",marginBottom:4}}>第1候補</div>
+            <RecommendationCard rec={effective} onStartFishingAt={null}/>
+            <div style={{display:"flex",gap:8,marginTop:-4,marginBottom:12}}>
+              <button onClick={()=>setShowFishPicker(v=>!v)}
+                style={{fontSize:11,padding:"5px 10px",borderRadius:8,border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#6a9bb8",cursor:"pointer"}}>
+                🐟 狙いを変更
+              </button>
+              <button onClick={()=>setShowSpotPicker(v=>!v)}
+                style={{fontSize:11,padding:"5px 10px",borderRadius:8,border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#6a9bb8",cursor:"pointer"}}>
+                📍 ポイントを変更
+              </button>
+            </div>
+            {showFishPicker&&(
+              <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:12}}>
+                {fishPickerOptions.map(f=>(
+                  <button key={f} onClick={()=>{setOverrideFishName(f);setOverrideSpotId(null);setShowFishPicker(false);}}
+                    style={{fontSize:11,padding:"5px 10px",borderRadius:20,cursor:"pointer",
+                      background:f===effectiveFishName?"#0d3a5c":"rgba(255,255,255,0.06)",
+                      border:`1px solid ${f===effectiveFishName?"#f5a623":"rgba(255,255,255,0.1)"}`,
+                      color:f===effectiveFishName?"#f5a623":"#6a9bb8"}}>
+                    {f}
+                  </button>
+                ))}
+              </div>
+            )}
+            {showSpotPicker&&(
+              <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:12}}>
+                {spots.length===0?<div style={{fontSize:11,color:"#6a9bb8"}}>登録済みポイントがありません</div>:
+                  spots.map(s=>(
+                    <button key={s.id} onClick={()=>{setOverrideSpotId(s.id);setShowSpotPicker(false);}}
+                      style={{fontSize:11,padding:"5px 10px",borderRadius:20,cursor:"pointer",
+                        background:s.id===overrideSpotId?"#0d3a5c":"rgba(255,255,255,0.06)",
+                        border:`1px solid ${s.id===overrideSpotId?"#f5a623":"rgba(255,255,255,0.1)"}`,
+                        color:s.id===overrideSpotId?"#f5a623":"#6a9bb8"}}>
+                      {s.name}
+                    </button>
+                  ))}
+              </div>
+            )}
+            {!effective.matchedSpot&&<div style={{fontSize:11,color:"#6a9bb8",marginBottom:12}}>ポイント未指定（登録済みポイントから選べます）</div>}
+          </div>
+
+          {/* 3. 第2・第3候補 */}
+          {others.length>0&&(
+            <div style={{marginBottom:12}}>
+              <div style={{fontSize:11,color:"#6a9bb8",marginBottom:6}}>その他の候補</div>
+              {others.map((o,i)=>(
+                <div key={o.fishName} style={{background:"rgba(255,255,255,0.05)",borderRadius:10,padding:"9px 12px",marginBottom:6}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <span style={{fontSize:13,fontWeight:700,color:"#fff"}}>
+                      {i+2}位 {o.fishName}{o.matchedSpot?` × ${o.matchedSpot.name}`:""}
+                    </span>
+                    <span style={{fontSize:12,color:"#f5a623"}}>{"★".repeat(o.stars)}{"☆".repeat(5-o.stars)}</span>
+                  </div>
+                  <div style={{fontSize:11,color:"#d0e8f5",marginTop:4}}>{(o.reasons.slice(0,2)).join("／")||"—"}</div>
+                  {o.cautions&&o.cautions.length>0&&<div style={{fontSize:11,color:"#f0b8b0",marginTop:2}}>注意：{o.cautions[0]}</div>}
+                  <button onClick={()=>setShowOthersDetail(v=>({...v,[o.fishName]:!v[o.fishName]}))}
+                    style={{fontSize:11,color:"#6a9bb8",background:"none",border:"none",cursor:"pointer",marginTop:6,padding:0}}>
+                    {showOthersDetail[o.fishName]?"閉じる":"詳しく見る"}
+                  </button>
+                  {showOthersDetail[o.fishName]&&<div style={{marginTop:8}}><RecommendationCard rec={o} onStartFishingAt={onStartFishingAt}/></div>}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* 4. 今日の条件 */}
+          <div style={{marginBottom:12}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+              <span style={{fontSize:12,color:"#6a9bb8",fontWeight:700}}>☀️ 今日の条件</span>
+              <button onClick={onOpenConditions}
+                style={{fontSize:11,padding:"4px 10px",borderRadius:8,border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#6a9bb8",cursor:"pointer"}}>
+                変更
+              </button>
+            </div>
+            {conditionsSummary.length>0?(
+              <div style={{fontSize:12,color:"#d0e8f5"}}>{conditionsSummary.join("・")}</div>
+            ):(
+              <div style={{fontSize:11,color:"#6a9bb8"}}>未入力です</div>
+            )}
+            {effectiveConditions&&effectiveConditions.plannedStartTime&&(
+              <div style={{fontSize:12,color:"#d0e8f5",marginTop:4}}>
+                開始予定 {effectiveConditions.plannedStartTime}
+                {effectiveConditions.plannedDurationMin&&`・釣行時間 ${effectiveConditions.plannedDurationMin}分`}
+                {plannedEnd&&`・終了予定 ${plannedEnd.text}`}
+              </div>
+            )}
+          </div>
+
+          {/* 7. 安全チェック */}
+          <div style={{marginBottom:12}}>
+            <div style={{fontSize:12,color:"#6a9bb8",fontWeight:700,marginBottom:4}}>🛟 安全チェック</div>
+            {safetyNotices.length===0?(
+              <div style={{fontSize:12,color:"#6a9bb8",lineHeight:1.6}}>現在入力されている条件では、強い安全警告はありません。</div>
+            ):(
+              safetyNotices.map((n,i)=>(
+                <div key={i} style={{fontSize:12,color:"#e84c3d",lineHeight:1.6}}>⚠ {n}</div>
+              ))
+            )}
+          </div>
+
+          {/* 5. 最近の周辺釣果 */}
+          <div style={{marginBottom:12}}>
+            <div style={{fontSize:12,color:"#6a9bb8",fontWeight:700,marginBottom:4}}>📰 最近の周辺釣果（{effective.fishName}）</div>
+            {reportsError?(
+              <div style={{fontSize:12,color:"#6a9bb8"}}>最新釣果情報を取得できませんでした。</div>
+            ):reportStats.total===0?(
+              <div style={{fontSize:12,color:"#6a9bb8"}}>現在利用できる情報はありません。</div>
+            ):(
+              <div style={{fontSize:12,color:"#d0e8f5",lineHeight:1.8}}>
+                直近7日：{reportStats.within7}件　30日以内：{reportStats.within30}件<br/>
+                岸：{reportStats.shoreCount}件　船：{reportStats.boatCount}件<br/>
+                最終確認：{reportStats.lastDays===0?"当日":reportStats.lastDays+"日前"}
+              </div>
+            )}
+            {updateStatus&&<div style={{fontSize:10,color:updateStatus.level==="alert"?"#e84c3d":"#6a9bb8",marginTop:4}}>{updateStatus.text}</div>}
+            {reportsMalformed&&<div style={{fontSize:10,color:"#e84c3d",marginTop:2}}>⚠️ 最新釣果情報の形式に問題があります</div>}
+          </div>
+
+          {/* 6. 自分の実績 */}
+          <div style={{marginBottom:12}}>
+            <div style={{fontSize:12,color:"#6a9bb8",fontWeight:700,marginBottom:4}}>🎣 自分の実績（{effective.fishName}）</div>
+            {personalStats.tripCount===0?(
+              <div style={{fontSize:12,color:"#6a9bb8",lineHeight:1.6}}>
+                自分の実績データはまだ少ないため、最近の周辺釣果と一般的な適性を中心に表示しています。
+              </div>
+            ):(
+              <div style={{fontSize:12,color:"#d0e8f5",lineHeight:1.8}}>
+                釣行{personalStats.overall.total}回中 釣果あり{personalStats.overall.withCatch}回
+                （{Math.round(personalStats.overall.withCatch/personalStats.overall.total*100)}%）
+                {sampleLabel(personalStats.overall.total)&&<span style={{color:"#f5a623"}}>（{sampleLabel(personalStats.overall.total)}）</span>}<br/>
+                総匹数 {personalStats.overall.totalCatch}匹
+                1時間あたり {personalStats.overall.catchPerHour!=null?personalStats.overall.catchPerHour.toFixed(2)+"匹":"算出不可"}<br/>
+                {personalStats.timeStat&&`時間帯実績：${personalStats.timeStat.count}回中${personalStats.timeStat.withCatch}回釣果あり`}
+                {personalStats.spotStat&&<><br/>ポイント実績：{personalStats.spotStat.total}回中{personalStats.spotStat.withCatch}回釣果あり</>}
+              </div>
+            )}
+          </div>
+
+          {/* 8. タックル適合 */}
+          <div style={{marginBottom:12}}>
+            <div style={{fontSize:12,color:"#6a9bb8",fontWeight:700,marginBottom:4}}>🎣 タックル適合</div>
+            <div style={{fontSize:12,color:"#d0e8f5",lineHeight:1.8}}>
+              ロッド：{gearProfile.rods?.[0]?.name||"未登録"}
+              {gearProfile.rods?.[0]&&`（${gearProfile.rods[0].lureWeightMinG}〜${gearProfile.rods[0].lureWeightMaxG}g）`}<br/>
+              {shownMethod?(<>おすすめ手法：{shownMethod.name}{shownMethod.typicalWeightG?`（目安${shownMethod.typicalWeightG}g）`:""}<br/></>):null}
+              判定：{effective.gearFit
+                ?<span style={{color:"#2ecc87"}}>○ 適合範囲</span>
+                :<span style={{color:"#e84c3d"}}>⚠ 現在のロッド適合範囲外</span>}
+            </div>
+          </div>
+
+          {/* 9. 持ち物確認 */}
+          <div style={{marginBottom:14}}>
+            <div style={{fontSize:12,color:"#6a9bb8",fontWeight:700,marginBottom:4}}>🎒 持ち物確認</div>
+            {gearTemplate?(
+              <div style={{fontSize:12,color:"#d0e8f5",lineHeight:1.8}}>
+                チェック済み {checkedCount}件 / 全{totalCount}件<br/>
+                {prepReady?(
+                  <span style={{color:"#2ecc87"}}>準備状況は良好です。</span>
+                ):(
+                  <>
+                    <span style={{color:"#e84c3d"}}>⚠ 準備未完了</span>
+                    <div style={{marginTop:4}}>未チェック：{uncheckedImportant.map(i=>i.label).join("、")}</div>
+                  </>
+                )}
+              </div>
+            ):(
+              <div style={{fontSize:12,color:"#6a9bb8"}}>持ち物テンプレートがありません。</div>
+            )}
+          </div>
+
+          {/* 10. 行動ボタン */}
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            {effective.matchedSpot?(
+              <button onClick={()=>onStartFishingAt(effective.matchedSpot,{targetFish:effective.fishName,
+                  rig:shownMethod?shownMethod.name:""})}
+                style={{width:"100%",padding:14,borderRadius:10,fontSize:15,fontWeight:700,cursor:"pointer",
+                  background:"#f5a623",border:"none",color:"#1a0a00"}}>
+                🎣 このプランで釣り開始
+              </button>
+            ):(
+              <div style={{fontSize:11,color:"#6a9bb8",textAlign:"center"}}>ポイント未指定のため開始できません。「📍 ポイントを変更」から選んでください。</div>
+            )}
+            <button onClick={()=>setShowSkip(true)}
+              style={{width:"100%",padding:10,borderRadius:10,fontSize:13,cursor:"pointer",
+                background:"transparent",border:"1px solid rgba(255,255,255,0.15)",color:"#6a9bb8"}}>
+              今日は見送る
+            </button>
+          </div>
+        </>
+      ):(
+        <div style={{fontSize:12,color:"#6a9bb8",lineHeight:1.7}}>
+          {reportsError?"最新釣果情報を取得できませんでした。自分の実績が増えると、ここに傾向が表示されます。"
+            :"おすすめを判断するデータが不足しています。自分の実績や周辺の釣果情報が増えると、ここに表示されます。"}
+        </div>
+      )}
+
+      <SkipLogModal show={showSkip} onClose={()=>setShowSkip(false)} snapshot={skipSnapshot}
+        onSave={({reason,note})=>{
+          onSaveSkipLog({
+            date:todayStr, plannedFish:effective?effective.fishName:"",
+            plannedSpotId:effective?.matchedSpot?.id||null, reason, note,
+            conditionsSnapshot:effectiveConditions||null,
+          });
+          setShowSkip(false);
+        }}/>
+    </div>
+  );
+}
+
+function TodayFishingView({activeSession,catches,fishMaster,recommendations,reports,reportsError,reportsMalformed,reportsUpdatedAt,todayConditions,onSaveTodayConditions,onResetTodayConditions,onStartFishingAt,trips,spots,targetProfiles,gearProfile,gearTemplates,onSaveSkipLog,onSwitchToSpots,onLogEvent,onLogCatch,onUpdateCatch,onEndSession,onOpenHomeMode}){
   const [showEnd,setShowEnd]=useState(false);
   const [showCatch,setShowCatch]=useState(false);
   const [onsiteCatch,setOnsiteCatch]=useState(null);
   const [showReports,setShowReports]=useState(false);
+  const [showConditions,setShowConditions]=useState(false);
   const [toast,setToast]=useState("");
   const flash=msg=>{ setToast(msg); clearTimeout(flash._t); flash._t=setTimeout(()=>setToast(""),1400); };
 
   if(!activeSession){
-    const updateStatus=reportsUpdateStatus(reportsUpdatedAt,Date.now());
-    const safetyNotices=getTodaySafetyNotices(todayConditions);
     return (
       <div style={{padding:"16px 14px"}}>
-        <TodayConditionsCard conditions={todayConditions} onSave={onSaveTodayConditions} onReset={onResetTodayConditions}/>
+        <BriefingView recommendations={recommendations} trips={trips} catches={catches} reports={reports}
+          targetProfiles={targetProfiles} gearProfile={gearProfile} spots={spots} gearTemplates={gearTemplates}
+          todayConditions={todayConditions} reportsUpdatedAt={reportsUpdatedAt} reportsError={reportsError}
+          reportsMalformed={reportsMalformed} onStartFishingAt={onStartFishingAt}
+          onOpenConditions={()=>setShowConditions(true)} onSaveSkipLog={onSaveSkipLog}/>
 
-        {safetyNotices.length>0&&(
-          <div style={{background:"rgba(232,76,61,0.12)",border:"1px solid rgba(232,76,61,0.35)",borderRadius:10,padding:"10px 12px",marginBottom:14}}>
-            {safetyNotices.map((n,i)=>(
-              <div key={i} style={{fontSize:12,color:"#e84c3d",lineHeight:1.6}}>⚠️ {n}</div>
-            ))}
-          </div>
-        )}
-
-        <div style={{fontSize:16,fontWeight:700,color:"#fff",marginBottom:4}}>🎣 今おすすめの狙い</div>
-        {updateStatus&&(
-          <div style={{fontSize:11,marginBottom:10,
-            color:updateStatus.level==="alert"?"#e84c3d":"#6a9bb8"}}>
-            {updateStatus.text}
-          </div>
-        )}
-        {reportsMalformed&&(
-          <div style={{fontSize:11,color:"#e84c3d",marginBottom:10}}>
-            ⚠️ 最新釣果情報の形式に問題があります（一部のデータのみ表示しています）
-          </div>
-        )}
-        {recommendations.length===0?(
-          <div style={{fontSize:12,color:"#6a9bb8",lineHeight:1.7,marginBottom:14}}>
-            {reportsError?"最新釣果情報を取得できませんでした。自分の実績が増えると、ここに傾向が表示されます。"
-              :"おすすめを判断するデータが不足しています。自分の実績や周辺の釣果情報が増えると、ここに表示されます。"}
-          </div>
-        ):(
-          <div style={{marginBottom:6}}>
-            {recommendations.slice(0,3).map((rec,i)=>(
-              <div key={rec.fishName}>
-                <div style={{fontSize:11,color:"#6a9bb8",marginBottom:2}}>{i+1}位</div>
-                <RecommendationCard rec={rec} onStartFishingAt={onStartFishingAt}/>
-              </div>
-            ))}
-          </div>
-        )}
-        {reportsError&&<div style={{fontSize:11,color:"#e84c3d",marginBottom:10}}>⚠️ 最新釣果情報を取得できませんでした</div>}
+        <TodayConditionsCard conditions={todayConditions} onSave={onSaveTodayConditions} onReset={onResetTodayConditions}
+          expanded={showConditions} onToggleExpanded={()=>setShowConditions(v=>!v)}/>
 
         <button onClick={()=>setShowReports(v=>!v)}
           style={{width:"100%",padding:"10px 8px",borderRadius:10,fontSize:13,fontWeight:600,cursor:"pointer",marginBottom:16,
@@ -2465,7 +2829,7 @@ function App(){
   useEffect(()=>{ saveStore(MEALS_KEY,{schemaVersion:1,meals}); },[meals]);
   useEffect(()=>{ saveStore(HOMEPROGRESS_KEY,{schemaVersion:1,progress:homeProgress}); },[homeProgress]);
 
-  const handleStartFishing=spot=>{
+  const handleStartFishing=(spot,extra)=>{
     if(activeSession&&!confirm("進行中のセッションがあります。終了して新しく開始しますか？"))return;
     const today=new Date().toISOString().slice(0,10);
     const inherited=todayConditions.date===today?{
@@ -2477,9 +2841,15 @@ function App(){
         ?`${todayConditions.windDirection} ${todayConditions.windSpeedMs}m/s`:(todayConditions.windDirection||""),
       waves:todayConditions.wave||"",
     }:{};
-    setActiveSession({...EMPTY_TRIP,...inherited,id:uid(),spotId:spot.id,spotName:spot.name,
+    setActiveSession({...EMPTY_TRIP,...inherited,...(extra||{}),id:uid(),spotId:spot.id,spotName:spot.name,
       startAt:Date.now(),date:today});
     setTab("today");
+  };
+
+  const handleSaveSkipLog=log=>{
+    const store=loadStore(SKIP_LOGS_KEY,{schemaVersion:1,logs:[]});
+    const rec={id:uid(),createdAt:Date.now(),...log};
+    saveStore(SKIP_LOGS_KEY,{schemaVersion:1,logs:[rec,...store.logs]});
   };
 
   const handleLogEvent=(type,note)=>{
@@ -2587,6 +2957,8 @@ function App(){
             reportsMalformed={reportsMalformed} reportsUpdatedAt={reportsUpdatedAt}
             todayConditions={todayConditions} onSaveTodayConditions={handleSaveTodayConditions}
             onResetTodayConditions={handleResetTodayConditions} onStartFishingAt={handleStartFishing}
+            trips={trips} spots={currentSpots} targetProfiles={targetProfiles} gearProfile={gearProfile}
+            gearTemplates={gearTemplates} onSaveSkipLog={handleSaveSkipLog}
             onSwitchToSpots={()=>setTab("spots")}
             onLogEvent={handleLogEvent} onLogCatch={handleLogCatch} onUpdateCatch={handleUpdateCatch}
             onEndSession={handleEndSession}
