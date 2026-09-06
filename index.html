@@ -37,6 +37,7 @@ const ANALYTICS_KEY = "fishing_analytics_settings_v1";
 const TARGET_PROFILES_KEY = "fishing_target_profiles_v1";
 const GEARPROFILE_KEY = "fishing_gear_profile_v1";
 const REPORTS_URL = "latest_reports.json";
+const REPORT_SOURCES_URL = "report_sources.json";
 const UNKNOWN_FISH = "魚種不明";
 
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
@@ -581,6 +582,14 @@ function sanitizeReportsPayload(raw){
   };
 }
 
+// Phase15: report_sources.json（更新確認先の一覧・チェック先リストであり自動収集対象ではない）の防御的検証。
+function sanitizeSourcesPayload(raw){
+  if(!raw||typeof raw!=="object"||!Array.isArray(raw.sources)) return null;
+  const REQUIRED=["id","name","url"];
+  const clean=raw.sources.filter(s=>s&&typeof s==="object"&&REQUIRED.every(k=>typeof s[k]==="string"&&s[k]));
+  return { sources: clean, malformedCount: raw.sources.length-clean.length };
+}
+
 function formatUpdatedAt(iso){
   const d=new Date(iso);
   if(isNaN(d.getTime())) return iso;
@@ -597,12 +606,60 @@ function reportsUpdateStatus(updatedAt,now){
   return {level:"alert",text:`⚠️ 最近の釣果情報が古くなっています（最終更新：${when}、${d}日経過）`};
 }
 
+// 外部由来（latest_reports.json / report_sources.json）のURLをリンクとして描画する前の安全確認。
+// http/https以外（javascript:等）はクリック可能なリンクにしない。
+function isSafeHttpUrl(url){
+  if(typeof url!=="string"||!url) return false;
+  return /^https?:\/\//i.test(url);
+}
+
 function freshnessLabel(days){
   if(days==null) return null;
   if(days<=7) return "新しい情報";
   if(days<=14) return "やや新しい";
   if(days<=30) return "参考情報";
   return "古い情報";
+}
+
+// ── Phase 15: 📰 最新釣果の更新支援（自動収集はしない。既存latest_reports.json/report_sources.jsonの突き合わせのみ） ──
+
+// reports全体を鮮度4バケット（freshnessLabelと同じ閾値：7/14/30日）で集計。岸/船は混ぜず別カウント。
+function getReportFreshnessBreakdown(reports,now){
+  const list=reports||[];
+  const buckets={ within7:0, d8to14:0, d15to30:0, over30:0, unknown:0 };
+  list.forEach(r=>{
+    const d=daysAgo(r.reportedAt,now);
+    if(d==null) buckets.unknown++;
+    else if(d<=7) buckets.within7++;
+    else if(d<=14) buckets.d8to14++;
+    else if(d<=30) buckets.d15to30++;
+    else buckets.over30++;
+  });
+  return { total:list.length, buckets,
+    shoreCount:list.filter(r=>r.fishingType==="shore").length,
+    boatCount:list.filter(r=>r.fishingType==="boat").length };
+}
+
+// report_sources.json（チェック先の一覧）の各情報源について、latest_reports.json中の該当sourceNameの
+// 最新reportedAtとの突き合わせのみ行う。情報源への実際のfetch・スクレイピングは行わない。
+function getSourceUpdateStatus(sources,reports,now){
+  const list=reports||[];
+  return (sources||[]).filter(s=>s.enabled!==false).map(s=>{
+    const matched=list.filter(r=>r.sourceName===s.name).sort((a,b)=>new Date(b.reportedAt)-new Date(a.reportedAt));
+    const latest=matched[0]||null;
+    const lastDays=latest?daysAgo(latest.reportedAt,now):null;
+    return { id:s.id, name:s.name, url:s.url, area:s.area, note:s.note,
+      reportCount:matched.length, lastDays, freshness:freshnessLabel(lastDays),
+      needsCheck: lastDays==null||lastDays>30 };
+  });
+}
+
+function getUpdateSupportSummary({reports,sources,reportsUpdatedAt,now}){
+  const freshness=getReportFreshnessBreakdown(reports,now);
+  const sourceStatus=getSourceUpdateStatus(sources,reports,now);
+  const needsCheck=[...sourceStatus].filter(s=>s.needsCheck)
+    .sort((a,b)=>(b.lastDays==null?99999:b.lastDays)-(a.lastDays==null?99999:a.lastDays));
+  return { freshness, sourceStatus, needsCheck, updateStatus:reportsUpdateStatus(reportsUpdatedAt,now) };
 }
 
 function gearFits(methodWeightG,gearProfile){
@@ -2433,12 +2490,69 @@ function RecommendationCard({rec,onStartFishingAt}){
   );
 }
 
-function ReportsListView({reports}){
+// Phase15: 情報の新しさ・不足・更新確認先を提示するだけのパネル。自動収集はしない。
+function UpdateSupportPanel({reports,sources,sourcesError,reportsUpdatedAt}){
+  const [open,setOpen]=useState(false);
+  const now=Date.now();
+  const summary=getUpdateSupportSummary({reports,sources,reportsUpdatedAt,now});
+  const { freshness,needsCheck,updateStatus }=summary;
+  const statusColor={ok:"#2ecc87",warn:"#f5a623",alert:"#e84c3d"}[updateStatus?.level]||"#6a9bb8";
+
+  return (
+    <div style={{background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.12)",borderRadius:10,padding:"10px 12px",marginBottom:12}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <span style={{fontSize:13,fontWeight:700,color:"#fff"}}>📰 最新釣果の更新支援</span>
+        <button onClick={()=>setOpen(v=>!v)}
+          style={{fontSize:11,padding:"3px 9px",borderRadius:8,border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#6a9bb8",cursor:"pointer"}}>
+          {open?"閉じる":"詳しく見る"}
+        </button>
+      </div>
+      <div style={{fontSize:11,color:statusColor,marginTop:4}}>
+        {updateStatus?updateStatus.text:"最終更新情報がありません。"}
+      </div>
+      {open&&(
+        <div style={{marginTop:8}}>
+          <div style={{fontSize:11,color:"#d0e8f5",marginBottom:6}}>
+            件数（{freshness.total}件・岸{freshness.shoreCount}／船{freshness.boatCount}）：
+            7日以内{freshness.buckets.within7}・8〜14日{freshness.buckets.d8to14}・
+            15〜30日{freshness.buckets.d15to30}・31日超{freshness.buckets.over30}
+            {freshness.buckets.unknown>0&&`・日付不明${freshness.buckets.unknown}`}
+          </div>
+          {sourcesError&&<div style={{fontSize:11,color:"#e84c3d",marginBottom:6}}>⚠️ 情報源一覧（report_sources.json）を取得できませんでした。</div>}
+          {!sourcesError&&(
+            needsCheck.length>0?(
+              <div>
+                <div style={{fontSize:11,color:"#f5a623",marginBottom:4}}>確認をおすすめする情報源：</div>
+                {needsCheck.map(s=>(
+                  <div key={s.id} style={{fontSize:11,color:"#d0e8f5",marginBottom:4,paddingLeft:4,borderLeft:"2px solid rgba(245,166,35,0.4)"}}>
+                    {isSafeHttpUrl(s.url)?(
+                      <a href={s.url} target="_blank" rel="noreferrer" style={{color:"#f5a623"}}>{s.name}</a>
+                    ):(
+                      <span style={{color:"#f5a623"}}>{s.name}</span>
+                    )}
+                    　{s.area}
+                    {s.lastDays==null?"この情報源からの掲載記録はまだありません":`最終掲載：${s.lastDays}日前`}
+                    {s.note&&<div style={{color:"#6a9bb8",marginTop:1}}>{s.note}</div>}
+                  </div>
+                ))}
+              </div>
+            ):(
+              <div style={{fontSize:11,color:"#6a9bb8"}}>{(sources||[]).length===0?"情報源一覧が未設定です。":"すべての情報源が直近30日以内に確認済みです。"}</div>
+            )
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ReportsListView({reports,sources,sourcesError,reportsUpdatedAt}){
   const [filter,setFilter]=useState("all");
   const filtered=reports.filter(r=>filter==="all"?true:r.fishingType===filter);
   const chips=[["all","すべて"],["shore","岸釣り"],["boat","船釣り"]];
   return (
     <div>
+      <UpdateSupportPanel reports={reports} sources={sources} sourcesError={sourcesError} reportsUpdatedAt={reportsUpdatedAt}/>
       <div style={{display:"flex",gap:6,marginBottom:12}}>
         {chips.map(([k,l])=>(
           <button key={k} onClick={()=>setFilter(k)}
@@ -2469,10 +2583,14 @@ function ReportsListView({reports}){
                 <div style={{fontSize:11,color:"#6a9bb8",marginTop:3}}>{r.area}・{r.spotName}・{r.reportedAt}（{freshnessLabel(days)}）</div>
                 <div style={{fontSize:11,color:"#6a9bb8",marginTop:2}}>{r.method}</div>
                 <div style={{fontSize:12,color:"#d0e8f5",marginTop:4}}>{r.catchSummary}</div>
-                <a href={r.sourceUrl} target="_blank" rel="noreferrer"
-                  style={{fontSize:11,color:"#f5a623",marginTop:6,display:"inline-block"}}>
-                  📎 {r.sourceName}
-                </a>
+                {isSafeHttpUrl(r.sourceUrl)?(
+                  <a href={r.sourceUrl} target="_blank" rel="noreferrer"
+                    style={{fontSize:11,color:"#f5a623",marginTop:6,display:"inline-block"}}>
+                    📎 {r.sourceName}
+                  </a>
+                ):(
+                  <span style={{fontSize:11,color:"#6a9bb8",marginTop:6,display:"inline-block"}}>📎 {r.sourceName}</span>
+                )}
               </div>
             );
           })}
@@ -3752,7 +3870,7 @@ function MorningCheckCard({todayConditions,spots,targetProfiles,fishMaster,gearP
 }
 
 // Phase14: 魚種起点の検索カード。判定ロジックは新設せず、既存の集計・安全判定関数を呼ぶだけ。新規localStorageなし（React stateのみ）。
-function FishSearchCard({todayConditions,spots,targetProfiles,gearProfile,fishMaster,trips,catches,reports,conditionsCache,onPlanHere,onOpenCompare}){
+function FishSearchCard({todayConditions,spots,targetProfiles,gearProfile,fishMaster,trips,catches,reports,reportsError,conditionsCache,onPlanHere,onOpenCompare}){
   const [query,setQuery]=useState("");
   const [resolvedFishName,setResolvedFishName]=useState(null);
   const [ambiguous,setAmbiguous]=useState(null);
@@ -3878,6 +3996,7 @@ function FishSearchCard({todayConditions,spots,targetProfiles,gearProfile,fishMa
           )}
 
           <div style={{fontSize:12,fontWeight:700,color:"#7ab3ff",margin:"10px 0 4px"}}>② 最近の釣果情報</div>
+          {reportsError&&<div style={{fontSize:12,color:"#e84c3d",marginBottom:6}}>⚠️ 最新釣果情報を取得できませんでした（情報が無いのではなく取得エラーです）。</div>}
           {reportStats&&(reportStats.shoreCount>0||reportStats.boatCount>0)?(
             <div style={{fontSize:12,color:"#d0e8f5",marginBottom:8}}>
               {reportStats.shoreCount>0?
@@ -3888,9 +4007,9 @@ function FishSearchCard({todayConditions,spots,targetProfiles,gearProfile,fishMa
                 <div style={{color:"#6a9bb8"}}>船釣り情報：{reportStats.boatCount}件（参考・岸釣りの実績としては数えていません）
                   {reportStats.boatFreshness&&`　最新：${reportStats.boatLastDays}日前（${reportStats.boatFreshness}）`}</div>}
             </div>
-          ):(
+          ):!reportsError?(
             <div style={{fontSize:12,color:"#6a9bb8",marginBottom:8}}>最近の釣果情報はまだありません。</div>
-          )}
+          ):null}
 
           <div style={{fontSize:12,fontWeight:700,color:"#7ab3ff",margin:"10px 0 4px"}}>③ 推奨仕掛け・タックル適合</div>
           {rigInfo&&rigInfo.registered?(
@@ -3935,7 +4054,7 @@ function TodayFishingView({activeSession,catches,fishMaster,recommendations,repo
   planCandidates,planForecastCache,planFetchStatus,onFetchOnePlanForecast,onFetchAllPlanForecasts,
   onAddPlanCandidate,onUpdatePlanCandidate,onDeletePlanCandidate,onDuplicatePlanCandidate,onAdoptPlanCandidate,adoptedPlan,
   onFetchPlanTide,morningCheck,morningCheckStatus,onMorningCheckFetch,onApplyMorningForecast,onEnsureCandidateForCurrentPlan,
-  skipLogs,onPlanFishHere}){
+  skipLogs,onPlanFishHere,reportSources,reportSourcesError}){
   const [showEnd,setShowEnd]=useState(false);
   const [showCatch,setShowCatch]=useState(false);
   const [onsiteCatch,setOnsiteCatch]=useState(null);
@@ -3971,6 +4090,7 @@ function TodayFishingView({activeSession,catches,fishMaster,recommendations,repo
               collapsed={!morningDetailOpen} onToggleCollapsed={()=>setMorningDetailOpen(v=>!v)}/>
             <FishSearchCard todayConditions={todayConditions} spots={spots} targetProfiles={targetProfiles}
               gearProfile={gearProfile} fishMaster={fishMaster} trips={trips} catches={catches} reports={reports}
+              reportsError={reportsError}
               conditionsCache={conditionsCache}
               onPlanHere={onPlanFishHere}
               onOpenCompare={()=>setShowPlanCompare(true)}/>
@@ -4014,7 +4134,7 @@ function TodayFishingView({activeSession,catches,fishMaster,recommendations,repo
             background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.15)",color:"#d0e8f5"}}>
           {showReports?"最近の周辺釣果を閉じる":"最近の周辺釣果を見る"}
         </button>
-        {showReports&&<div style={{marginBottom:16}}><ReportsListView reports={reports}/></div>}
+        {showReports&&<div style={{marginBottom:16}}><ReportsListView reports={reports} sources={reportSources} sourcesError={reportSourcesError} reportsUpdatedAt={reportsUpdatedAt}/></div>}
 
         <div style={{textAlign:"center",padding:"24px 10px",color:"#6a9bb8",fontSize:13,lineHeight:2,
           borderTop:"1px solid rgba(255,255,255,0.1)"}}>
@@ -5194,6 +5314,8 @@ function App(){
   const [reportsError,setReportsError]=useState(false);
   const [reportsMalformed,setReportsMalformed]=useState(false);
   const [reportsUpdatedAt,setReportsUpdatedAt]=useState(null);
+  const [reportSources,setReportSources]=useState([]);
+  const [reportSourcesError,setReportSourcesError]=useState(false);
   const [todayConditions,setTodayConditions]=useState(()=>loadStore(TODAYCONDITIONS_KEY,EMPTY_TODAY_CONDITIONS));
   const [conditionsCache,setConditionsCache]=useState(()=>loadStore(CONDITIONS_CACHE_KEY,null));
   const [autoFetchStatus,setAutoFetchStatus]=useState({loading:false,error:null});
@@ -5220,6 +5342,23 @@ function App(){
       if(sanitized.malformedCount>0) setReportsMalformed(true);
     }).catch(()=>{
       if(!cancelled){ setExternalReports([]); setReportsError(true); }
+    });
+    return ()=>{ cancelled=true; };
+  },[]);
+
+  // Phase15: report_sources.json（更新確認先の一覧）の取得。失敗しても他機能（魚検索・ブリーフィング等）には影響しない。
+  useEffect(()=>{
+    let cancelled=false;
+    fetch(REPORT_SOURCES_URL).then(res=>{
+      if(!res.ok) throw new Error("fetch failed");
+      return res.json();
+    }).then(data=>{
+      if(cancelled) return;
+      const sanitized=sanitizeSourcesPayload(data);
+      if(sanitized===null){ setReportSources([]); setReportSourcesError(true); return; }
+      setReportSources(sanitized.sources);
+    }).catch(()=>{
+      if(!cancelled){ setReportSources([]); setReportSourcesError(true); }
     });
     return ()=>{ cancelled=true; };
   },[]);
@@ -5651,6 +5790,7 @@ function App(){
             onMorningCheckFetch={handleMorningCheckFetch} onApplyMorningForecast={handleApplyMorningForecast}
             onEnsureCandidateForCurrentPlan={handleEnsureCandidateForCurrentPlan}
             onPlanFishHere={handlePlanFishHere}
+            reportSources={reportSources} reportSourcesError={reportSourcesError}
             skipLogs={currentSkipLogs}
             onSwitchToSpots={()=>setTab("spots")}
             onLogEvent={handleLogEvent} onLogCatch={handleLogCatch} onUpdateCatch={handleUpdateCatch}
