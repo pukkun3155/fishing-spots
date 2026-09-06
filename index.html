@@ -387,6 +387,7 @@ const EMPTY_TODAY_CONDITIONS = {
   weather:"", temperatureC:"", windDirection:"", windSpeedMs:"",
   tideType:"", tideDirection:"", wave:"", turbidity:"",
   source:"manual", updatedAt:null,
+  spotId:"", targetFish:"", // Phase11: 朝チェックが採用済みプランを識別するために使用
 };
 
 function isConditionsActive(dateStr,todayStr){
@@ -564,7 +565,7 @@ function getTargetRecommendations({trips,catches,reports,targetProfiles,gearProf
 // ── Phase 7: 釣行前ブリーフィング ──
 
 const SKIP_LOGS_KEY = "fishing_skip_logs_v1";
-const SKIP_REASON_OPTIONS = ["強風","高波","雨","時間不足","準備不足","気分","その他"];
+const SKIP_REASON_OPTIONS = ["強風","高波","雨","雷","条件悪化","準備不足","時間不足","気分","その他"];
 const IMPORTANT_GEAR_LABELS = ["仕掛け","予備仕掛け","オモリ","エサ","ハサミ","タオル","ウェットティッシュ","ゴミ袋","手洗い用の水","クーラーボックス","保冷剤または氷"];
 
 function computePlannedEndTime(startTime,durationMin){
@@ -1134,6 +1135,80 @@ function getPlanComparativeLabels(evaluations){
     if(min.weather.precipitationMm===0) labels[min.candidate.id].push(`${n}候補中 降水が最も少ない`);
   }
   return labels;
+}
+
+// ── Phase 11: 朝チェック（採用済みプランの出発直前再確認） ──
+
+const MORNING_CHECK_KEY = "fishing_morning_check_v1";
+// 過敏に警告しないための変化しきい値。これ未満は「ほぼ同じ」とみなす。
+const MORNING_DIFF_THRESHOLD = { wind:0.5, wave:0.1, rain:0.5 };
+
+function computePlanKey(spotId,date,startTime,targetFish){
+  return `${spotId||""}|${date||""}|${startTime||""}|${targetFish||""}`;
+}
+
+// Phase8のweatherCodeToLabel/degToCompass8を使い、生値とラベルの両方を保持したスナップショットを作る。
+function buildMorningSnapshot(weather,marine){
+  return {
+    weather: weather?weatherCodeToLabel(weather.weatherCode):null,
+    temperatureC: weather&&weather.temperatureC!=null?weather.temperatureC:null,
+    precipitationMm: weather&&weather.precipitationMm!=null?weather.precipitationMm:null,
+    windDirection: weather?degToCompass8(weather.windDirectionDeg):null,
+    windSpeedMs: weather&&weather.windSpeedMs!=null?weather.windSpeedMs:null,
+    windGustMs: weather&&weather.windGustMs!=null?weather.windGustMs:null,
+    waveHeightM: marine&&marine.waveHeightM!=null?marine.waveHeightM:null,
+    waveDirection: marine?degToCompass8(marine.waveDirectionDeg):null,
+    wavePeriodSec: marine&&marine.wavePeriodSec!=null?marine.wavePeriodSec:null,
+    weatherCode: weather&&weather.weatherCode!=null?weather.weatherCode:null,
+  };
+}
+
+function morningDiffOne(previous,latest,threshold){
+  if(previous==null||latest==null) return {previous:previous??null,latest:latest??null,delta:null,status:null};
+  const delta=Math.round((latest-previous)*100)/100;
+  const status=Math.abs(delta)<threshold?"same":(delta>0?"worse":"better");
+  return {previous,latest,delta,status};
+}
+
+// 純粋関数：前回と最新の差分を項目ごとに算出する。風向・気温は「変化のみ」で良否判定しない。
+function getMorningCheckDiff(previous,latest){
+  const p=previous||{}, l=latest||{};
+  return {
+    wind: morningDiffOne(p.windSpeedMs,l.windSpeedMs,MORNING_DIFF_THRESHOLD.wind),
+    gust: morningDiffOne(p.windGustMs,l.windGustMs,MORNING_DIFF_THRESHOLD.wind),
+    wave: morningDiffOne(p.waveHeightM,l.waveHeightM,MORNING_DIFF_THRESHOLD.wave),
+    rain: morningDiffOne(p.precipitationMm,l.precipitationMm,MORNING_DIFF_THRESHOLD.rain),
+    temp: { previous:p.temperatureC??null, latest:l.temperatureC??null,
+      delta:(p.temperatureC!=null&&l.temperatureC!=null)?Math.round((l.temperatureC-p.temperatureC)*10)/10:null, status:null },
+    windDirection: { previous:p.windDirection??null, latest:l.windDirection??null },
+    thunderAppeared: weatherCodeHazard(p.weatherCode)!=="thunderstorm"&&weatherCodeHazard(l.weatherCode)==="thunderstorm",
+  };
+}
+
+// 純粋関数：総合判定。安全→予報の変化→タックル適合の優先順位で決める（Phase10の安全ブロッカーをそのまま再利用）。
+function getMorningCheckVerdict({weather,marine,weatherError,marineError,gearOk,diff}){
+  const blockers=getPlanSafetyBlockers(weather,marine);
+  if(blockers.length>0) return { level:"caution", label:"⚠ 条件注意", blockers };
+  if(!weather&&!marine&&(weatherError||marineError)) return { level:"insufficient", label:"？ 情報不足" };
+  const statuses=diff?Object.values(diff).map(d=>d&&d.status).filter(Boolean):[];
+  const anyWorse=statuses.includes("worse");
+  const anyChanged=statuses.some(s=>s!=="same");
+  if(gearOk===false) return { level:"attention", label:"△ 条件変化あり" };
+  if(anyWorse) return { level:"attention", label:"△ 条件変化あり" };
+  if(anyChanged) return { level:"good", label:"○ 概ね予定通り" };
+  return { level:"top", label:"◎ 予定通り候補" };
+}
+
+// 純粋関数：開始予定時刻までのカウントダウン文言（当日のみ）。日付跨ぎはcomputePlannedEndTime同様、時刻のみで比較。
+function formatPlanCountdown(dateStr,startTime,todayStr,now){
+  if(dateStr!==todayStr) return null;
+  const startMin=minutesFromTimeStr(startTime);
+  if(startMin==null) return null;
+  const n=new Date(now);
+  const nowMin=n.getHours()*60+n.getMinutes();
+  const diff=startMin-nowMin;
+  if(diff>=0) return { text:`開始まであと${formatDurationMin(diff)}`, overdue:false, minutes:diff, veryEarly:diff>=720 };
+  return { text:`開始予定時刻を${formatDurationMin(-diff)}過ぎています`, overdue:true, minutes:-diff, veryEarly:false };
 }
 
 const EMPTY = {
@@ -2767,10 +2842,292 @@ function PlanCompareView({candidates,spots,targetProfiles,fishMaster,gearProfile
   );
 }
 
+function MorningCheckCard({todayConditions,spots,targetProfiles,fishMaster,gearProfile,trips,catches,reports,reportsUpdatedAt,
+  conditionsCache,tideCache,morningCheck,morningCheckStatus,
+  onFetchLatest,onFetchTide,onApplyAutoField,onSaveSkipLog,onAdoptPlan,
+  onAdjustTime,onViewCandidates}){
+  const [collapsed,setCollapsed]=useState(false);
+  const [showDetail,setShowDetail]=useState(false);
+  const [showSkip,setShowSkip]=useState(false);
+  const [applyForecast,setApplyForecast]=useState(false);
+
+  const now=Date.now();
+  const todayStr=new Date().toISOString().slice(0,10);
+  const spot=spots.find(s=>s.id===todayConditions.spotId)||null;
+  const fishName=todayConditions.targetFish;
+
+  // Phase11の表示条件：採用済みspot/targetFishが必須、かつ予定日が「今日」であること（明日・過去日は非表示＝通常ブリーフィングを使う）
+  if(!spot||!fishName) return null;
+  if(!todayConditions.plannedStartTime) return null;
+  if(todayConditions.date!==todayStr) return null;
+
+  const countdown=formatPlanCountdown(todayConditions.date,todayConditions.plannedStartTime,todayStr,now);
+  const forecastForMs=computeForecastForMs(todayConditions.date,todayConditions.plannedStartTime);
+  const planKey=computePlanKey(spot.id,todayConditions.date,todayConditions.plannedStartTime,fishName);
+
+  const cacheMatchesPlan=!!(conditionsCache&&conditionsCache.spotId===spot.id&&conditionsCache.forecastFor===forecastForMs);
+  const hasLatest=!!(morningCheck&&morningCheck.planKey===planKey&&morningCheck.latestSnapshot);
+  const latestSnapshot=hasLatest?morningCheck.latestSnapshot:(cacheMatchesPlan?buildMorningSnapshot(conditionsCache.weather,conditionsCache.marine):null);
+  const previousSnapshot=(morningCheck&&morningCheck.planKey===planKey)?morningCheck.previousSnapshot:null;
+  const checkedAt=(morningCheck&&morningCheck.planKey===planKey)?morningCheck.checkedAt:null;
+  const cacheAgeMin=checkedAt?formatCacheAgeMinutes(checkedAt,now):null;
+
+  const weather=cacheMatchesPlan?conditionsCache.weather:null;
+  const marine=cacheMatchesPlan?conditionsCache.marine:null;
+  const weatherError=cacheMatchesPlan?conditionsCache.weatherError:null;
+  const marineError=cacheMatchesPlan?conditionsCache.marineError:null;
+
+  const diff=(hasLatest&&previousSnapshot)?getMorningCheckDiff(previousSnapshot,latestSnapshot):null;
+
+  const profile=targetProfiles.find(p=>p.fishName===fishName)||null;
+  const methods=profile?.recommendedMethods||[];
+  const fitMethod=methods.find(m=>gearFits(m.typicalWeightG,gearProfile))||null;
+  const gearOk=methods.length===0?true:!!fitMethod;
+
+  const verdict=getMorningCheckVerdict({weather,marine,weatherError,marineError,gearOk,diff});
+  const verdictColor={top:"#2ecc87",good:"#7ab3ff",attention:"#f5a623",caution:"#e84c3d",insufficient:"#6a9bb8"}[verdict.level];
+
+  const reportStats=getPlanReportStats(reports,fishName,now);
+  const personalStats=getBriefingPersonalStats({trips,catches,fishName,matchedSpot:spot,
+    todayConditions:{plannedStartTime:todayConditions.plannedStartTime},now});
+
+  const tideMatchesPlan=!!(tideCache&&spot.tideStationId&&tideCache.stationId===spot.tideStationId&&tideCache.date===todayConditions.date);
+  const tideAgeMin=tideMatchesPlan?formatCacheAgeMinutes(tideCache.fetchedAt,now):null;
+  const tideRelation=tideMatchesPlan?computeTideRelation(todayConditions.plannedStartTime,tideCache.highs,tideCache.lows):null;
+
+  const gearTemplate=null; // 持ち物はPhase7側のテンプレートを参照（App側から渡さず、簡易表示のみここでは省略）
+
+  // 音声向けの短い一文
+  let voiceLine;
+  if(verdict.level==="caution"){
+    voiceLine=`${verdict.blockers[0]}のため条件注意です。時間変更または見送り候補を確認してください。`;
+  }else if(verdict.level==="attention"){
+    voiceLine="前回確認より条件が変化しています。内容を確認してから判断してください。";
+  }else if(verdict.level==="insufficient"){
+    voiceLine="最新の予報がまだ取得できていません。取得してから判断してください。";
+  }else{
+    voiceLine="現在は注意基準未満です。予定通り行く候補として確認できます。";
+  }
+
+  const skipSnapshot={fishName, spotName:spot.name};
+
+  if(collapsed){
+    return (
+      <button onClick={()=>setCollapsed(false)}
+        style={{width:"100%",padding:"9px 10px",borderRadius:10,fontSize:12,cursor:"pointer",marginBottom:14,
+          background:"rgba(46,204,135,0.1)",border:"1px solid rgba(46,204,135,0.3)",color:"#2ecc87",textAlign:"left"}}>
+        ✓ 予定通り確認済み（{cacheAgeMin!=null?`${cacheAgeMin}分前`:"確認済み"}）・再表示
+      </button>
+    );
+  }
+
+  return (
+    <div style={{background:"rgba(255,255,255,0.06)",border:`1px solid ${verdictColor}55`,borderRadius:14,padding:"14px 14px 16px",marginBottom:16}}>
+      <div style={{fontSize:16,fontWeight:700,color:"#fff",marginBottom:4}}>🌅 朝チェック</div>
+      <div style={{fontSize:13,color:"#d0e8f5",marginBottom:2}}>
+        今日 {todayConditions.plannedStartTime}
+        {todayConditions.plannedDurationMin&&`〜${computePlannedEndTime(todayConditions.plannedStartTime,todayConditions.plannedDurationMin)?.text||""}`}
+      </div>
+      <div style={{fontSize:14,fontWeight:700,color:"#fff",marginBottom:6}}>{fishName} × {spot.name}</div>
+
+      {countdown&&(
+        <div style={{fontSize:12,color:countdown.overdue?"#f5a623":"#6a9bb8",marginBottom:2}}>{countdown.text}</div>
+      )}
+      {countdown&&countdown.veryEarly&&(
+        <div style={{fontSize:11,color:"#6a9bb8",marginBottom:6}}>出発直前の再確認は開始数時間前がおすすめです。</div>
+      )}
+      <div style={{fontSize:10,color:"#6a9bb8",marginBottom:10}}>
+        {checkedAt?`前回確認：${new Date(checkedAt).toLocaleDateString("ja-JP").slice(0,-1)!==new Date(now).toLocaleDateString("ja-JP").slice(0,-1)?"前日確認 → ":""}${new Date(checkedAt).toLocaleTimeString("ja-JP",{hour:"2-digit",minute:"2-digit"})}　`:"前回確認：なし　"}
+        現在：{new Date(now).toLocaleTimeString("ja-JP",{hour:"2-digit",minute:"2-digit"})}
+      </div>
+
+      <div style={{background:"rgba(255,255,255,0.05)",border:`1px solid ${verdictColor}55`,borderRadius:10,padding:"10px 12px",marginBottom:10}}>
+        <div style={{fontSize:15,fontWeight:700,color:verdictColor}}>{verdict.label}</div>
+        <div style={{fontSize:12,color:"#d0e8f5",marginTop:4,lineHeight:1.6}}>{voiceLine}</div>
+      </div>
+
+      {!hasLatest?(
+        <div style={{marginBottom:10}}>
+          <div style={{fontSize:11,color:"#6a9bb8",marginBottom:6}}>まだ最新条件を確認していません。</div>
+          <button onClick={onFetchLatest} disabled={morningCheckStatus&&morningCheckStatus.loading}
+            style={{width:"100%",padding:"10px 8px",borderRadius:9,fontSize:13,fontWeight:700,
+              cursor:morningCheckStatus&&morningCheckStatus.loading?"default":"pointer",
+              background:"#f5a623",border:"none",color:"#1a0a00"}}>
+            {morningCheckStatus&&morningCheckStatus.loading?"取得中…":"🔄 最新条件を確認"}
+          </button>
+          {morningCheckStatus&&morningCheckStatus.error&&<div style={{fontSize:11,color:"#e84c3d",marginTop:4}}>⚠️ {morningCheckStatus.error}</div>}
+        </div>
+      ):(
+        <>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+            <span style={{fontSize:11,color:"#6a9bb8"}}>{cacheAgeMin!=null?`予報：${cacheAgeMin}分前取得`:""}
+              {cacheAgeMin!=null&&cacheAgeMin>30&&"（予報を再確認してください）"}</span>
+            <button onClick={onFetchLatest} disabled={morningCheckStatus&&morningCheckStatus.loading}
+              style={{fontSize:11,padding:"5px 10px",borderRadius:8,border:"1px solid rgba(122,179,255,0.4)",
+                background:"rgba(122,179,255,0.15)",color:"#7ab3ff",cursor:"pointer"}}>
+              {morningCheckStatus&&morningCheckStatus.loading?"取得中…":"🔄 再確認"}
+            </button>
+          </div>
+          {morningCheckStatus&&morningCheckStatus.error&&<div style={{fontSize:11,color:"#e84c3d",marginBottom:6}}>⚠️ {morningCheckStatus.error}</div>}
+
+          <div style={{fontSize:12,color:"#d0e8f5",lineHeight:1.8,marginBottom:8}}>
+            {latestSnapshot.weather&&<>天気　{latestSnapshot.weather}<br/></>}
+            {latestSnapshot.temperatureC!=null&&<>気温　{latestSnapshot.temperatureC}℃<br/></>}
+            {(latestSnapshot.windDirection||latestSnapshot.windSpeedMs!=null)&&<>風　{latestSnapshot.windDirection||""} {latestSnapshot.windSpeedMs!=null?latestSnapshot.windSpeedMs+"m/s":""}<br/></>}
+            {latestSnapshot.windGustMs!=null&&<>突風　{latestSnapshot.windGustMs}m/s<br/></>}
+            {latestSnapshot.waveHeightM!=null&&<>波高　{latestSnapshot.waveHeightM}m<br/></>}
+            {latestSnapshot.precipitationMm!=null&&<>降水　{latestSnapshot.precipitationMm}mm<br/></>}
+            {!weather&&weatherError&&<div style={{color:"#e84c3d"}}>天気：{weatherError}</div>}
+            {!marine&&marineError&&<div style={{color:"#e84c3d"}}>波：{marineError}</div>}
+          </div>
+
+          {diff?(
+            <div style={{background:"rgba(255,255,255,0.05)",borderRadius:8,padding:"8px 10px",marginBottom:8,fontSize:12,color:"#d0e8f5",lineHeight:1.9}}>
+              <div style={{color:"#6a9bb8",marginBottom:4}}>前回との差</div>
+              {diff.wind.status&&<div>風速　前回{diff.wind.previous}m/s → 今回{diff.wind.latest}m/s　{diff.wind.status==="worse"?"↑":diff.wind.status==="better"?"↓":"→"}{diff.wind.delta>0?"+":""}{diff.wind.delta}m/s</div>}
+              {diff.gust.status&&<div>突風　前回{diff.gust.previous}m/s → 今回{diff.gust.latest}m/s　{diff.gust.status==="worse"?"↑":diff.gust.status==="better"?"↓":"→"}{diff.gust.delta>0?"+":""}{diff.gust.delta}m/s</div>}
+              {diff.wave.status&&<div>波高　前回{diff.wave.previous}m → 今回{diff.wave.latest}m　{diff.wave.status==="worse"?"↑":diff.wave.status==="better"?"↓":"→"}{diff.wave.delta>0?"+":""}{diff.wave.delta}m</div>}
+              {diff.rain.status&&<div>降水　前回{diff.rain.previous}mm → 今回{diff.rain.latest}mm</div>}
+              {diff.temp.delta!=null&&<div>気温　前回{diff.temp.previous}℃ → 今回{diff.temp.latest}℃</div>}
+              {diff.windDirection.previous&&diff.windDirection.latest&&diff.windDirection.previous!==diff.windDirection.latest&&
+                <div>風向　前回{diff.windDirection.previous} → 今回{diff.windDirection.latest}</div>}
+              {diff.thunderAppeared&&<div style={{color:"#e84c3d"}}>⚠ 雷の可能性が追加されています</div>}
+            </div>
+          ):(
+            <div style={{fontSize:11,color:"#6a9bb8",marginBottom:8}}>前回比較データなし</div>
+          )}
+
+          {verdict.blockers&&verdict.blockers.length>0&&(
+            <div style={{fontSize:12,color:"#e84c3d",lineHeight:1.7,marginBottom:8}}>
+              {verdict.blockers.map((b,i)=><div key={i}>⚠ {b}</div>)}
+            </div>
+          )}
+
+          {(()=>{
+            const autoVals=buildAutoFieldValues(weather,marine);
+            const conflicts=Object.entries(autoVals).filter(([k,v])=>v!=null&&todayConditions[k]&&todayConditions[k]!==v);
+            if(conflicts.length===0) return null;
+            return (
+              <div style={{marginBottom:8,fontSize:12,color:"#d0e8f5"}}>
+                <div style={{color:"#f5a623",marginBottom:4}}>手入力済みの値と異なります（自動上書きしません）：</div>
+                {conflicts.map(([k,v])=>(
+                  <div key={k} style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+                    <span>{AUTO_FIELD_LABELS[k]}：自動{v} / 現在{todayConditions[k]}</span>
+                    <button onClick={()=>onApplyAutoField(k,v)}
+                      style={{fontSize:10,padding:"3px 8px",borderRadius:6,border:"1px solid rgba(245,166,35,0.4)",background:"transparent",color:"#f5a623",cursor:"pointer"}}>
+                      自動値を反映
+                    </button>
+                  </div>
+                ))}
+              </div>
+            );
+          })()}
+        </>
+      )}
+
+      <button onClick={()=>setShowDetail(v=>!v)}
+        style={{fontSize:11,color:"#6a9bb8",background:"none",border:"none",cursor:"pointer",padding:0,marginBottom:8}}>
+        {showDetail?"詳細を閉じる":"潮汐・釣果・実績・タックル・持ち物を見る"}
+      </button>
+
+      {showDetail&&(
+        <div style={{marginBottom:8}}>
+          <div style={{fontSize:12,color:"#6a9bb8",fontWeight:700,marginBottom:4}}>🌊 潮汐</div>
+          {!spot.tideStationId?(
+            <div style={{fontSize:11,color:"#6a9bb8",marginBottom:8}}>潮汐観測地点が未設定です</div>
+          ):!tideMatchesPlan?(
+            <button onClick={()=>onFetchTide({spotId:spot.id,date:todayConditions.date,startTime:todayConditions.plannedStartTime})}
+              style={{width:"100%",padding:"8px 8px",borderRadius:8,fontSize:12,fontWeight:600,cursor:"pointer",marginBottom:8,
+                background:"rgba(122,179,255,0.15)",border:"1px solid rgba(122,179,255,0.4)",color:"#7ab3ff"}}>
+              🌊 潮汐を取得
+            </button>
+          ):(
+            <div style={{fontSize:12,color:"#d0e8f5",lineHeight:1.8,marginBottom:8}}>
+              {tideAgeMin!=null&&<div style={{fontSize:10,color:"#6a9bb8"}}>気象庁 天文潮位（{tideAgeMin<60?`${tideAgeMin}分前`:`${Math.floor(tideAgeMin/60)}時間前`}・{spot.tideStationName}）</div>}
+              {tideCache.highs.map((h,i)=><div key={"h"+i}>満潮 {h.time}（{h.heightCm}cm）</div>)}
+              {tideCache.lows.map((l,i)=><div key={"l"+i}>干潮 {l.time}（{l.heightCm}cm）</div>)}
+              {tideRelation&&tideRelation.nextHigh&&<div>満潮まで{formatDurationMin(tideRelation.nextHigh.min-tideRelation.planMin)}</div>}
+              {tideRelation&&tideRelation.nextLow&&<div>干潮まで{formatDurationMin(tideRelation.nextLow.min-tideRelation.planMin)}</div>}
+              {tideRelation&&tideRelation.direction&&<div>天文潮位上：{tideRelation.direction}</div>}
+            </div>
+          )}
+
+          <div style={{fontSize:12,color:"#6a9bb8",fontWeight:700,marginBottom:4}}>📰 最近の周辺釣果（{fishName}）</div>
+          <div style={{fontSize:12,color:"#d0e8f5",lineHeight:1.8,marginBottom:8}}>
+            {reportStats.shoreCount===0&&reportStats.boatCount===0?"最近の岸情報は少なめです":(
+              <>直近7日以内の岸情報：{reportStats.shoreWithin7}件　30日以内：{reportStats.shoreWithin30}件
+                {reportStats.boatCount>0&&<><br/>船情報：{reportStats.boatCount}件（岸釣り実績には含みません）</>}</>
+            )}
+          </div>
+
+          <div style={{fontSize:12,color:"#6a9bb8",fontWeight:700,marginBottom:4}}>🎣 本人実績</div>
+          <div style={{fontSize:12,color:"#d0e8f5",lineHeight:1.8,marginBottom:8}}>
+            {personalStats.tripCount===0?"実績データはまだ少なめです":(
+              <>{fishName} × {spot.name}：釣行{personalStats.overall.total}回中 釣果あり{personalStats.overall.withCatch}回
+                {sampleLabel(personalStats.overall.total)&&<span style={{color:"#f5a623"}}>（{sampleLabel(personalStats.overall.total)}）</span>}
+                {personalStats.timeStat&&<><br/>時間帯実績：{personalStats.timeStat.count}回中{personalStats.timeStat.withCatch}回</>}</>
+            )}
+          </div>
+
+          <div style={{fontSize:12,color:"#6a9bb8",fontWeight:700,marginBottom:4}}>🎣 タックル適合</div>
+          <div style={{fontSize:12,color:"#d0e8f5",marginBottom:8}}>
+            {gearOk?<span style={{color:"#2ecc87"}}>○ 適合</span>:<span style={{color:"#e84c3d"}}>⚠ 適合外</span>}
+            {fitMethod&&`（${fitMethod.name}）`}
+          </div>
+
+          <div style={{fontSize:11,color:"#6a9bb8",marginBottom:8}}>持ち物は採用後にPhase7ブリーフィングでご確認ください。</div>
+        </div>
+      )}
+
+      {hasLatest&&(
+        <label style={{display:"flex",alignItems:"center",gap:6,fontSize:11,color:"#6a9bb8",marginBottom:10,cursor:"pointer"}}>
+          <input type="checkbox" checked={applyForecast} onChange={e=>setApplyForecast(e.target.checked)}/>
+          最新予報値を今日の条件へ反映する（未入力の項目のみ）
+        </label>
+      )}
+
+      <div style={{display:"flex",flexDirection:"column",gap:8}}>
+        <button onClick={()=>{ if(applyForecast) onAdoptPlan(); setCollapsed(true); }}
+          style={{width:"100%",padding:13,borderRadius:10,fontSize:14,fontWeight:700,cursor:"pointer",
+            background:"#f5a623",border:"none",color:"#1a0a00"}}>
+          ✅ 予定通り行く
+        </button>
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={onAdjustTime}
+            style={{flex:1,padding:10,borderRadius:10,fontSize:12,cursor:"pointer",
+              background:"transparent",border:"1px solid rgba(255,255,255,0.15)",color:"#6a9bb8"}}>
+            🕐 時間をずらす
+          </button>
+          <button onClick={onViewCandidates}
+            style={{flex:1,padding:10,borderRadius:10,fontSize:12,cursor:"pointer",
+              background:"transparent",border:"1px solid rgba(255,255,255,0.15)",color:"#6a9bb8"}}>
+            📅 別候補を見る
+          </button>
+        </div>
+        <button onClick={()=>setShowSkip(true)}
+          style={{width:"100%",padding:10,borderRadius:10,fontSize:13,cursor:"pointer",
+            background:"transparent",border:"1px solid rgba(232,76,61,0.4)",color:"rgba(232,76,61,0.8)"}}>
+          ✖ 今日は見送る
+        </button>
+      </div>
+
+      <SkipLogModal show={showSkip} onClose={()=>setShowSkip(false)} snapshot={skipSnapshot}
+        onSave={({reason,note})=>{
+          onSaveSkipLog({
+            date:todayConditions.date, plannedFish:fishName, plannedSpotId:spot.id, reason, note,
+            conditionsSnapshot:{ plan:{date:todayConditions.date,startTime:todayConditions.plannedStartTime,spotName:spot.name,fishName},
+              todayConditions, weather:latestSnapshot, tide:tideMatchesPlan?{stationName:spot.tideStationName,direction:tideRelation?.direction||null}:null },
+          });
+          setShowSkip(false);
+        }}/>
+    </div>
+  );
+}
+
 function TodayFishingView({activeSession,catches,fishMaster,recommendations,reports,reportsError,reportsMalformed,reportsUpdatedAt,todayConditions,onSaveTodayConditions,onResetTodayConditions,onStartFishingAt,trips,spots,targetProfiles,gearProfile,gearTemplates,onSaveSkipLog,conditionsCache,autoFetchStatus,onFetchAutoConditions,onApplyAutoField,tideCache,autoTideStatus,onFetchTide,onSwitchToSpots,onLogEvent,onLogCatch,onUpdateCatch,onEndSession,onOpenHomeMode,
   planCandidates,planForecastCache,planFetchStatus,onFetchOnePlanForecast,onFetchAllPlanForecasts,
   onAddPlanCandidate,onUpdatePlanCandidate,onDeletePlanCandidate,onDuplicatePlanCandidate,onAdoptPlanCandidate,adoptedPlan,
-  onFetchPlanTide}){
+  onFetchPlanTide,morningCheck,morningCheckStatus,onMorningCheckFetch,onApplyMorningForecast,onEnsureCandidateForCurrentPlan}){
   const [showEnd,setShowEnd]=useState(false);
   const [showCatch,setShowCatch]=useState(false);
   const [onsiteCatch,setOnsiteCatch]=useState(null);
@@ -2783,6 +3140,16 @@ function TodayFishingView({activeSession,catches,fishMaster,recommendations,repo
   if(!activeSession){
     return (
       <div style={{padding:"16px 14px"}}>
+        {!showPlanCompare&&(
+          <MorningCheckCard todayConditions={todayConditions} spots={spots} targetProfiles={targetProfiles} fishMaster={fishMaster}
+            gearProfile={gearProfile} trips={trips} catches={catches} reports={reports} reportsUpdatedAt={reportsUpdatedAt}
+            conditionsCache={conditionsCache} tideCache={tideCache}
+            morningCheck={morningCheck} morningCheckStatus={morningCheckStatus}
+            onFetchLatest={onMorningCheckFetch} onFetchTide={onFetchPlanTide} onApplyAutoField={onApplyAutoField}
+            onSaveSkipLog={onSaveSkipLog} onAdoptPlan={onApplyMorningForecast}
+            onAdjustTime={()=>{ onEnsureCandidateForCurrentPlan(); setShowPlanCompare(true); }}
+            onViewCandidates={()=>setShowPlanCompare(true)}/>
+        )}
         <button onClick={()=>setShowPlanCompare(v=>!v)}
           style={{width:"100%",padding:"11px 8px",borderRadius:10,fontSize:13,fontWeight:700,cursor:"pointer",marginBottom:14,
             background:showPlanCompare?"rgba(255,255,255,0.06)":"rgba(245,166,35,0.15)",
@@ -3800,6 +4167,8 @@ function App(){
   const [planForecastCache,setPlanForecastCache]=useState(()=>loadStore(PLAN_FORECAST_CACHE_KEY,{schemaVersion:1,entries:{}}));
   const [planFetchStatus,setPlanFetchStatus]=useState({loading:false,error:null});
   const [adoptedPlan,setAdoptedPlan]=useState(null);
+  const [morningCheck,setMorningCheck]=useState(()=>loadStore(MORNING_CHECK_KEY,null));
+  const [morningCheckStatus,setMorningCheckStatus]=useState({loading:false,error:null});
 
   useEffect(()=>{
     let cancelled=false;
@@ -3826,6 +4195,7 @@ function App(){
   useEffect(()=>{ if(tideCache) saveStore(TIDE_CACHE_KEY,tideCache); },[tideCache]);
   useEffect(()=>{ saveStore(PLAN_CANDIDATES_KEY,{schemaVersion:1,candidates:planCandidates,updatedAt:Date.now()}); },[planCandidates]);
   useEffect(()=>{ saveStore(PLAN_FORECAST_CACHE_KEY,planForecastCache); },[planForecastCache]);
+  useEffect(()=>{ if(morningCheck) saveStore(MORNING_CHECK_KEY,morningCheck); },[morningCheck]);
 
   useEffect(()=>{ saveStore(SESSION_KEY,{schemaVersion:1,session:activeSession}); },[activeSession]);
   useEffect(()=>{ saveStore(TRIPS_KEY,{schemaVersion:1,trips}); },[trips]);
@@ -4078,7 +4448,8 @@ function App(){
     const applyForecast=!!(opts&&opts.applyForecast);
     const spot=currentSpots.find(s=>s.id===candidate.spotId);
     setTodayConditions(prev=>{
-      let merged={...prev,date:candidate.date,plannedStartTime:candidate.startTime,plannedDurationMin:candidate.durationMin};
+      let merged={...prev,date:candidate.date,plannedStartTime:candidate.startTime,plannedDurationMin:candidate.durationMin,
+        spotId:candidate.spotId||"",targetFish:candidate.targetFish||""};
       if(applyForecast&&spot){
         const forecastForMs=computeForecastForMs(candidate.date,candidate.startTime);
         const key=planForecastCacheKey(spot.id,forecastForMs);
@@ -4102,6 +4473,84 @@ function App(){
       return {...merged,updatedAt:Date.now()};
     });
     setAdoptedPlan({fishName:candidate.targetFish||null,spotId:candidate.spotId||null,nonce:Date.now()});
+  };
+
+  // Phase11: 朝チェックの「🔄 最新条件を確認」。Phase8のfetchAutoConditions・Phase9のtide関連ヘルパーを再利用し、
+  // 別のfetch実装は作らない。取得前の値を previousSnapshot として退避してから最新値を latestSnapshot に入れる。
+  const handleMorningCheckFetch=async()=>{
+    const spot=currentSpots.find(s=>s.id===todayConditions.spotId);
+    if(!spot||!spot.lat||!spot.lng){
+      setMorningCheckStatus({loading:false,error:"予報取得にはポイントの緯度経度が必要です"});
+      return;
+    }
+    const forecastForMs=computeForecastForMs(todayConditions.date,todayConditions.plannedStartTime);
+    const planKey=computePlanKey(spot.id,todayConditions.date,todayConditions.plannedStartTime,todayConditions.targetFish);
+
+    let previousSnapshot=null;
+    if(conditionsCache&&conditionsCache.spotId===spot.id&&conditionsCache.forecastFor===forecastForMs){
+      previousSnapshot=buildMorningSnapshot(conditionsCache.weather,conditionsCache.marine);
+    }else if(morningCheck&&morningCheck.planKey===planKey&&morningCheck.latestSnapshot){
+      previousSnapshot=morningCheck.latestSnapshot;
+    }else{
+      const cacheKey=planForecastCacheKey(spot.id,forecastForMs);
+      const entry=planForecastCache.entries[cacheKey];
+      if(entry&&entry.forecastFor===forecastForMs) previousSnapshot=buildMorningSnapshot(entry.weather,entry.marine);
+    }
+
+    setMorningCheckStatus({loading:true,error:null});
+    try{
+      const {weather,marine,weatherError,marineError}=await fetchAutoConditions({lat:spot.lat,lng:spot.lng,forecastForMs});
+      if(!weather&&!marine){
+        setMorningCheckStatus({loading:false,error:"最新条件を取得できませんでした。前回の情報のまま判断してください。"});
+        return;
+      }
+      setConditionsCache({schemaVersion:1,fetchedAt:Date.now(),forecastFor:forecastForMs,
+        spotId:spot.id,latitude:spot.lat,longitude:spot.lng,weather,marine,weatherError,marineError});
+      setMorningCheck({schemaVersion:1,planKey,checkedAt:Date.now(),forecastFor:forecastForMs,
+        spotId:spot.id,targetFish:todayConditions.targetFish,
+        previousSnapshot,latestSnapshot:buildMorningSnapshot(weather,marine),
+        tideSnapshot:(morningCheck&&morningCheck.planKey===planKey)?morningCheck.tideSnapshot:null,
+        result:null,note:""});
+      setMorningCheckStatus({loading:false,error:null});
+    }catch(e){
+      setMorningCheckStatus({loading:false,error:"最新条件を取得できませんでした。前回の情報のまま判断してください。"});
+    }
+  };
+
+  // 「✅ 予定通り行く」で「反映する」を選んだ場合のみ、Phase8と同じ手入力優先ルールでtoday_conditionsへ反映する。
+  const handleApplyMorningForecast=()=>{
+    const spot=currentSpots.find(s=>s.id===todayConditions.spotId);
+    if(!spot) return;
+    const forecastForMs=computeForecastForMs(todayConditions.date,todayConditions.plannedStartTime);
+    setTodayConditions(prev=>{
+      let merged={...prev};
+      if(conditionsCache&&conditionsCache.spotId===spot.id&&conditionsCache.forecastFor===forecastForMs&&(conditionsCache.weather||conditionsCache.marine)){
+        const autoVals=buildAutoFieldValues(conditionsCache.weather,conditionsCache.marine);
+        const anyManualBefore=["weather","temperatureC","windDirection","windSpeedMs","wave","tideDirection"].some(k=>merged[k]);
+        const {next,filledFromAuto}=mergeConditionsWithAuto(merged,autoVals,{overwrite:false});
+        if(filledFromAuto.length>0) merged={...next,source:anyManualBefore?"mixed":(merged.source==="manual"?"auto":(merged.source||"auto"))};
+      }
+      if(tideCache&&tideCache.stationId===spot.tideStationId&&tideCache.date===todayConditions.date&&!merged.tideDirection){
+        const rel=computeTideRelation(todayConditions.plannedStartTime,tideCache.highs,tideCache.lows);
+        if(rel&&rel.direction){
+          const anyManualBefore=["weather","temperatureC","windDirection","windSpeedMs","wave"].some(k=>merged[k]);
+          merged={...merged,tideDirection:rel.direction,source:anyManualBefore?"mixed":(merged.source==="manual"?"auto":(merged.source||"auto"))};
+        }
+      }
+      return {...merged,updatedAt:Date.now()};
+    });
+  };
+
+  // 「🕐 時間をずらす」の下準備：現在のプランに対応する候補がなければ現在値で1件追加する（時間そのものは変更しない）。
+  // 比較画面を開く操作自体はTodayFishingView側のローカル状態で行う。
+  const handleEnsureCandidateForCurrentPlan=()=>{
+    setPlanCandidates(prev=>{
+      const exists=prev.some(c=>c.spotId===todayConditions.spotId&&c.targetFish===todayConditions.targetFish&&c.date===todayConditions.date);
+      if(exists||prev.length>=MAX_PLAN_CANDIDATES) return prev;
+      return [...prev,{...EMPTY_PLAN_CANDIDATE,id:uid(),date:todayConditions.date,startTime:todayConditions.plannedStartTime,
+        durationMin:todayConditions.plannedDurationMin||EMPTY_PLAN_CANDIDATE.durationMin,
+        spotId:todayConditions.spotId,targetFish:todayConditions.targetFish}];
+    });
   };
 
   const recommendations=getTargetRecommendations({
@@ -4139,6 +4588,9 @@ function App(){
             onDeletePlanCandidate={handleDeletePlanCandidate} onDuplicatePlanCandidate={handleDuplicatePlanCandidate}
             onAdoptPlanCandidate={handleAdoptPlanCandidate} adoptedPlan={adoptedPlan}
             onFetchPlanTide={handleFetchPlanTide}
+            morningCheck={morningCheck} morningCheckStatus={morningCheckStatus}
+            onMorningCheckFetch={handleMorningCheckFetch} onApplyMorningForecast={handleApplyMorningForecast}
+            onEnsureCandidateForCurrentPlan={handleEnsureCandidateForCurrentPlan}
             onSwitchToSpots={()=>setTab("spots")}
             onLogEvent={handleLogEvent} onLogCatch={handleLogCatch} onUpdateCatch={handleUpdateCatch}
             onEndSession={handleEndSession}
