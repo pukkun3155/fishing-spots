@@ -372,12 +372,96 @@ function gearFits(methodWeightG,gearProfile){
   return (gearProfile.rods||[]).some(r=>methodWeightG>=r.lureWeightMinG&&methodWeightG<=r.lureWeightMaxG);
 }
 
-function getTargetRecommendations({trips,catches,reports,targetProfiles,gearProfile,now}){
+// ── Phase 6: 今日の条件 ──
+
+const TODAYCONDITIONS_KEY = "fishing_today_conditions_v1";
+const WEATHER_OPTIONS = ["晴れ","曇り","雨","不明"];
+const WIND_DIR_OPTIONS = ["北","北東","東","南東","南","南西","西","北西","不明"];
+const TIDE_TYPE_OPTIONS = ["大潮","中潮","小潮","長潮","若潮","不明"];
+const TIDE_DIRECTION_OPTIONS = ["上げ","下げ","満潮前後","干潮前後","不明"];
+const WAVE_OPTIONS = ["穏やか","やや波あり","高め","不明"];
+const TURBIDITY_OPTIONS = ["澄み","やや濁り","濁り","不明"];
+
+const EMPTY_TODAY_CONDITIONS = {
+  date:"", plannedStartTime:"", plannedDurationMin:"",
+  weather:"", temperatureC:"", windDirection:"", windSpeedMs:"",
+  tideType:"", tideDirection:"", wave:"", turbidity:"",
+  source:"manual", updatedAt:null,
+};
+
+function windSpeedLabel(ms){
+  const n=parseFloat(ms);
+  if(isNaN(n)) return null;
+  if(n<3) return "弱い";
+  if(n<5) return "やや風あり";
+  if(n<7) return "風が強め";
+  return "岸釣りでは注意";
+}
+
+function getTodaySafetyNotices(todayConditions){
+  if(!todayConditions) return [];
+  const notices=[];
+  const windLabel=windSpeedLabel(todayConditions.windSpeedMs);
+  if(windLabel==="風が強め"||windLabel==="岸釣りでは注意"){
+    notices.push(`風速${todayConditions.windSpeedMs}m/s：${windLabel}。無理のない判断をしてください。`);
+  }
+  if(todayConditions.wave==="高め"){
+    notices.push("波が高めです。サーフ・磯・テトラ等、足場の悪い場所では十分注意してください。");
+  }
+  return notices;
+}
+
+function conditionMatchForFish({trips,catches,fishName,field,value,excludeFromScoring}){
+  if(!value||value==="不明") return null;
+  const triedTripIds=new Set(trips.filter(t=>t.targetFish===fishName).map(t=>t.id));
+  catches.filter(c=>c.fishName===fishName).forEach(c=>triedTripIds.add(c.tripId));
+  const relevant=trips.filter(t=>triedTripIds.has(t.id));
+  const matched=relevant.filter(t=>(t[field]||"").includes(value));
+  if(matched.length===0) return null;
+  const caughtTripIds=new Set(catches.filter(c=>c.fishName===fishName).map(c=>c.tripId));
+  const matchedWithCatch=matched.filter(t=>caughtTripIds.has(t.id));
+  const rate=matchedWithCatch.length/matched.length;
+  const bonus=!excludeFromScoring&&matched.length>=3&&rate>=0.5;
+  return {count:matched.length,withCatch:matchedWithCatch.length,bonus};
+}
+
+function timeBucketMatchForFish({trips,catches,fishName,bucket}){
+  const triedTripIds=new Set(trips.filter(t=>t.targetFish===fishName).map(t=>t.id));
+  catches.filter(c=>c.fishName===fishName).forEach(c=>triedTripIds.add(c.tripId));
+  const relevant=trips.filter(t=>triedTripIds.has(t.id)&&t.startAt);
+  const matched=relevant.filter(t=>timeBucketOf(new Date(t.startAt).getHours())===bucket);
+  if(matched.length===0) return null;
+  const caughtTripIds=new Set(catches.filter(c=>c.fishName===fishName).map(c=>c.tripId));
+  const matchedWithCatch=matched.filter(t=>caughtTripIds.has(t.id));
+  return {count:matched.length,withCatch:matchedWithCatch.length};
+}
+
+function bestSpotForFish({fishName,trips,catches,spots}){
+  const caughtTripIds=catches.filter(c=>c.fishName===fishName).map(c=>c.tripId);
+  const spotCount=new Map();
+  caughtTripIds.forEach(tid=>{
+    const trip=trips.find(t=>t.id===tid);
+    if(trip&&trip.spotId) spotCount.set(trip.spotId,(spotCount.get(trip.spotId)||0)+1);
+  });
+  if(spotCount.size>0){
+    const bestId=[...spotCount.entries()].sort((a,b)=>b[1]-a[1])[0][0];
+    const spot=(spots||[]).find(s=>s.id===bestId);
+    if(spot) return spot;
+  }
+  const tagged=(spots||[]).find(s=>(s.fish||"").split(/[,、，]/).map(x=>x.trim()).includes(fishName));
+  return tagged||null;
+}
+
+function getTargetRecommendations({trips,catches,reports,targetProfiles,gearProfile,spots,todayConditions,now}){
   now=now||Date.now();
   const shoreReports=reports.filter(r=>r.fishingType==="shore");
   const boatReports=reports.filter(r=>r.fishingType==="boat");
   const nowMonth=new Date(now).getMonth();
-  const nowBucket=timeBucketOf(new Date(now).getHours());
+  let nowBucket=timeBucketOf(new Date(now).getHours());
+  if(todayConditions&&todayConditions.plannedStartTime){
+    const hh=parseInt(todayConditions.plannedStartTime.split(":")[0],10);
+    if(!isNaN(hh)) nowBucket=timeBucketOf(hh);
+  }
 
   const scored=targetProfiles.map(profile=>{
     const fishName=profile.fishName;
@@ -397,35 +481,63 @@ function getTargetRecommendations({trips,catches,reports,targetProfiles,gearProf
       const d=t.date?new Date(t.date+"T00:00:00"):(t.startAt?new Date(t.startAt):null);
       return d&&d.getMonth()===nowMonth;
     });
-    const timeMatch=personalTrips.some(t=>t.startAt&&timeBucketOf(new Date(t.startAt).getHours())===nowBucket);
+    const timeMatch=timeBucketMatchForFish({trips,catches,fishName,bucket:nowBucket});
 
     const methods=profile.recommendedMethods||[];
     const fitMethod=methods.find(m=>gearFits(m.typicalWeightG,gearProfile))||null;
 
-    let score=0; const reasons=[];
+    let score=0; const reasons=[]; const cautions=[];
     if(shoreDays!=null){
       if(shoreDays<=7){score+=3;reasons.push(`直近${shoreDays===0?"当日":shoreDays+"日前"}の岸釣りで釣果情報あり（${latestShore.sourceName}）`);}
       else if(shoreDays<=14){score+=2;reasons.push(`${shoreDays}日前の岸釣り釣果情報あり（${latestShore.sourceName}）`);}
       else if(shoreDays<=30){score+=1;reasons.push(`${shoreDays}日前の岸釣り釣果情報あり（参考情報・${latestShore.sourceName}）`);}
-      else{reasons.push(`岸釣り情報はありますが${shoreDays}日前とやや古めです（${latestShore.sourceName}）`);}
+      else{cautions.push(`岸釣り情報はありますが${shoreDays}日前とやや古めです（${latestShore.sourceName}）`);}
     }else if(latestBoat){
       score-=2;
-      reasons.push("最近の情報は船釣りのみで、岸からの実績情報は見つかっていません");
+      cautions.push("最近の情報は船釣りのみで、岸からの実績情報は見つかっていません");
     }
     if(personalTripCount>0){
       score+=2;
       reasons.push(`自分の実績あり（釣行${personalTripCount}回・${personalCount}匹）`);
     }
     if(monthMatch){score+=1;reasons.push("今の時期（月）に自分で釣った実績あり");}
-    if(timeMatch){score+=1;reasons.push("この時間帯に自分で釣った実績あり");}
+    if(timeMatch){
+      score+=1;
+      reasons.push(`予定時間帯の実績：${timeMatch.count}回中${timeMatch.withCatch}回釣果あり`);
+    }
     if(profile.beginnerFriendly){score+=1;reasons.push("初心者向け");}
     if(profile.shoreTargetable){score+=1;reasons.push("岸から狙える");}
     if(methods.length>0){
       if(fitMethod){score+=2;reasons.push(`手持ちタックルで対応可（${fitMethod.name}）`);}
-      else reasons.push("推奨される仕掛けが手持ちタックルの適合範囲外です");
+      else cautions.push("推奨される仕掛けが手持ちタックルの適合範囲外です");
     }
+
+    if(todayConditions){
+      const specs=[
+        ["weather","天気",todayConditions.weather,false],
+        ["tide","潮",todayConditions.tideType,false],
+        ["tideDirection","潮の動き",todayConditions.tideDirection,false],
+        ["wind","風向",todayConditions.windDirection,false],
+        ["waves","波",todayConditions.wave,todayConditions.wave==="高め"],
+        ["turbidity","濁り",todayConditions.turbidity,false],
+      ];
+      specs.forEach(([field,label,value,exclude])=>{
+        const m=conditionMatchForFish({trips,catches,fishName,field,value,excludeFromScoring:exclude});
+        if(!m) return;
+        if(m.bonus){
+          score+=1;
+          reasons.push(`${label}${value}：過去${m.count}回中${m.withCatch}回釣果あり`);
+        }else if(exclude){
+          reasons.push(`${label}${value}：過去${m.count}回中${m.withCatch}回釣果あり（安全のためおすすめ度には反映していません）`);
+        }else{
+          const label2=sampleLabel(m.count);
+          reasons.push(`${label}${value}：過去${m.count}回中${m.withCatch}回釣果あり${label2?`（${label2}）`:""}`);
+        }
+      });
+    }
+
     if(latestShore==null&&latestBoat==null&&personalTripCount===0){
-      reasons.push("外部情報・自分の実績のどちらもまだありません");
+      cautions.push("外部情報・自分の実績のどちらもまだありません");
     }else if(latestShore==null&&latestBoat==null&&personalTripCount>0){
       reasons.push("外部の最新情報はまだ無く、自分の実績のみに基づく表示です");
     }else if(personalTripCount===0&&(latestShore||latestBoat)){
@@ -434,8 +546,9 @@ function getTargetRecommendations({trips,catches,reports,targetProfiles,gearProf
 
     const stars=score<=1?1:score<=3?2:score<=5?3:score<=7?4:5;
     const eligible=shoreDays!=null||!!latestBoat||personalTripCount>0;
+    const matchedSpot=bestSpotForFish({fishName,trips,catches,spots});
 
-    return { fishName, score, stars, reasons, eligible,
+    return { fishName, score, stars, reasons, cautions, eligible, matchedSpot,
       latestShore, latestBoat, shoreDays, shoreFreshness:freshnessLabel(shoreDays),
       personalTripCount, personalCount, gearFit:!fitMethod&&methods.length>0?false:true };
   });
@@ -1103,11 +1216,13 @@ function OnsiteHandlingGuide({catchItem,fishMaster,onClose,onDone}){
   );
 }
 
-function RecommendationCard({rec}){
+function RecommendationCard({rec,onStartFishingAt}){
   return (
     <div style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:12,padding:"12px 14px",marginBottom:10}}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-        <span style={{fontSize:15,fontWeight:700,color:"#fff"}}>🐟 {rec.fishName}</span>
+        <span style={{fontSize:15,fontWeight:700,color:"#fff"}}>
+          🐟 {rec.fishName}{rec.matchedSpot?` × ${rec.matchedSpot.name}`:""}
+        </span>
         <span style={{fontSize:14,color:"#f5a623"}}>{"★".repeat(rec.stars)}{"☆".repeat(5-rec.stars)}</span>
       </div>
       <div style={{display:"flex",flexWrap:"wrap",gap:8,marginTop:6,fontSize:11,color:"#6a9bb8"}}>
@@ -1115,11 +1230,33 @@ function RecommendationCard({rec}){
         <span>自分の実績：{rec.personalTripCount}回</span>
         <span>データ鮮度：{rec.shoreFreshness?`${rec.shoreDays===0?"当日":rec.shoreDays+"日前"}（${rec.shoreFreshness}）`:"—"}</span>
       </div>
-      <div style={{marginTop:8,display:"flex",flexDirection:"column",gap:3}}>
-        {rec.reasons.map((r,i)=>(
-          <div key={i} style={{fontSize:11,color:"#d0e8f5"}}>・{r}</div>
-        ))}
-      </div>
+      {rec.reasons.length>0&&(
+        <div style={{marginTop:8}}>
+          <div style={{fontSize:10,color:"#2ecc87",fontWeight:700,marginBottom:3}}>プラス要因</div>
+          <div style={{display:"flex",flexDirection:"column",gap:3}}>
+            {rec.reasons.map((r,i)=>(
+              <div key={i} style={{fontSize:11,color:"#d0e8f5"}}>・{r}</div>
+            ))}
+          </div>
+        </div>
+      )}
+      {rec.cautions&&rec.cautions.length>0&&(
+        <div style={{marginTop:8}}>
+          <div style={{fontSize:10,color:"#e84c3d",fontWeight:700,marginBottom:3}}>注意</div>
+          <div style={{display:"flex",flexDirection:"column",gap:3}}>
+            {rec.cautions.map((c,i)=>(
+              <div key={i} style={{fontSize:11,color:"#f0b8b0"}}>・{c}</div>
+            ))}
+          </div>
+        </div>
+      )}
+      {rec.matchedSpot&&onStartFishingAt&&(
+        <button onClick={()=>onStartFishingAt(rec.matchedSpot)}
+          style={{width:"100%",marginTop:10,padding:"9px 0",borderRadius:8,fontSize:13,fontWeight:700,cursor:"pointer",
+            border:"1px solid rgba(245,166,35,0.4)",background:"rgba(245,166,35,0.15)",color:"#f5a623"}}>
+          🎣 {rec.matchedSpot.name}で釣り開始
+        </button>
+      )}
     </div>
   );
 }
@@ -1173,7 +1310,101 @@ function ReportsListView({reports}){
   );
 }
 
-function TodayFishingView({activeSession,catches,fishMaster,recommendations,reports,reportsError,reportsMalformed,reportsUpdatedAt,onSwitchToSpots,onLogEvent,onLogCatch,onUpdateCatch,onEndSession,onOpenHomeMode}){
+function TodayConditionsCard({conditions,onSave,onReset}){
+  const [expanded,setExpanded]=useState(false);
+  const today=new Date().toISOString().slice(0,10);
+  const isStale=!!(conditions.date&&conditions.date!==today);
+  const current=isStale?EMPTY_TODAY_CONDITIONS:conditions;
+
+  const set=(k,v)=>{
+    onSave({...current,[k]:v,date:today,source:"manual",updatedAt:Date.now()});
+  };
+
+  const windLabel=windSpeedLabel(current.windSpeedMs);
+  const hasAny=!isStale&&(current.weather||current.tideType||current.windSpeedMs||current.plannedStartTime||current.wave||current.turbidity);
+
+  const summaryParts=[];
+  if(current.plannedStartTime) summaryParts.push(`開始${current.plannedStartTime}`);
+  if(current.weather) summaryParts.push(current.weather);
+  if(current.tideType) summaryParts.push(current.tideType);
+  if(current.windSpeedMs) summaryParts.push(`風${current.windSpeedMs}m/s${windLabel?`(${windLabel})`:""}`);
+  if(current.wave) summaryParts.push(`波${current.wave}`);
+
+  return (
+    <div style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:12,padding:"12px 14px",marginBottom:14}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <span style={{fontSize:14,fontWeight:700,color:"#fff"}}>☀️ 今日の条件</span>
+        <button onClick={()=>setExpanded(v=>!v)}
+          style={{fontSize:11,padding:"4px 10px",borderRadius:8,border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#6a9bb8",cursor:"pointer"}}>
+          {expanded?"閉じる":hasAny?"編集":"入力する"}
+        </button>
+      </div>
+      {isStale&&(
+        <div style={{fontSize:11,color:"#f5a623",marginTop:6}}>
+          前回入力（{conditions.date}）の条件が残っています。今日の分を入力してください。
+        </div>
+      )}
+      {!expanded&&hasAny&&<div style={{fontSize:12,color:"#d0e8f5",marginTop:6}}>{summaryParts.join("・")}</div>}
+      {!expanded&&!hasAny&&<div style={{fontSize:11,color:"#6a9bb8",marginTop:6}}>未入力（未入力でも「今おすすめの狙い」は表示されます）</div>}
+      {expanded&&(
+        <div style={{marginTop:10}}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            <Field label="釣行予定開始時刻"><Input type="time" value={current.plannedStartTime} onChange={e=>set("plannedStartTime",e.target.value)}/></Field>
+            <Field label="釣行予定時間（分）"><Input type="number" value={current.plannedDurationMin} onChange={e=>set("plannedDurationMin",e.target.value)}/></Field>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            <Field label="天気">
+              <Sel value={current.weather} onChange={e=>set("weather",e.target.value)}>
+                <option value="">選択</option>{WEATHER_OPTIONS.map(o=><option key={o} value={o}>{o}</option>)}
+              </Sel>
+            </Field>
+            <Field label="気温（℃）"><Input type="number" value={current.temperatureC} onChange={e=>set("temperatureC",e.target.value)}/></Field>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            <Field label="風向">
+              <Sel value={current.windDirection} onChange={e=>set("windDirection",e.target.value)}>
+                <option value="">選択</option>{WIND_DIR_OPTIONS.map(o=><option key={o} value={o}>{o}</option>)}
+              </Sel>
+            </Field>
+            <Field label="風速（m/s）"><Input type="number" step="0.1" value={current.windSpeedMs} onChange={e=>set("windSpeedMs",e.target.value)}/></Field>
+          </div>
+          {windLabel&&<div style={{fontSize:11,color:windLabel==="弱い"?"#6a9bb8":"#f5a623",marginBottom:8,marginTop:-4}}>風の目安：{windLabel}</div>}
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            <Field label="潮">
+              <Sel value={current.tideType} onChange={e=>set("tideType",e.target.value)}>
+                <option value="">選択</option>{TIDE_TYPE_OPTIONS.map(o=><option key={o} value={o}>{o}</option>)}
+              </Sel>
+            </Field>
+            <Field label="潮の動き">
+              <Sel value={current.tideDirection} onChange={e=>set("tideDirection",e.target.value)}>
+                <option value="">選択</option>{TIDE_DIRECTION_OPTIONS.map(o=><option key={o} value={o}>{o}</option>)}
+              </Sel>
+            </Field>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            <Field label="波">
+              <Sel value={current.wave} onChange={e=>set("wave",e.target.value)}>
+                <option value="">選択</option>{WAVE_OPTIONS.map(o=><option key={o} value={o}>{o}</option>)}
+              </Sel>
+            </Field>
+            <Field label="濁り">
+              <Sel value={current.turbidity} onChange={e=>set("turbidity",e.target.value)}>
+                <option value="">選択</option>{TURBIDITY_OPTIONS.map(o=><option key={o} value={o}>{o}</option>)}
+              </Sel>
+            </Field>
+          </div>
+          <button onClick={()=>{ if(confirm("今日の条件をリセットしますか？（過去の釣行記録には影響しません）")) onReset(); }}
+            style={{width:"100%",padding:9,borderRadius:9,fontSize:12,cursor:"pointer",marginTop:4,
+              background:"transparent",border:"1px solid rgba(232,76,61,0.4)",color:"rgba(232,76,61,0.8)"}}>
+            今日の条件をリセット
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TodayFishingView({activeSession,catches,fishMaster,recommendations,reports,reportsError,reportsMalformed,reportsUpdatedAt,todayConditions,onSaveTodayConditions,onResetTodayConditions,onStartFishingAt,onSwitchToSpots,onLogEvent,onLogCatch,onUpdateCatch,onEndSession,onOpenHomeMode}){
   const [showEnd,setShowEnd]=useState(false);
   const [showCatch,setShowCatch]=useState(false);
   const [onsiteCatch,setOnsiteCatch]=useState(null);
@@ -1183,8 +1414,19 @@ function TodayFishingView({activeSession,catches,fishMaster,recommendations,repo
 
   if(!activeSession){
     const updateStatus=reportsUpdateStatus(reportsUpdatedAt,Date.now());
+    const safetyNotices=getTodaySafetyNotices(todayConditions);
     return (
       <div style={{padding:"16px 14px"}}>
+        <TodayConditionsCard conditions={todayConditions} onSave={onSaveTodayConditions} onReset={onResetTodayConditions}/>
+
+        {safetyNotices.length>0&&(
+          <div style={{background:"rgba(232,76,61,0.12)",border:"1px solid rgba(232,76,61,0.35)",borderRadius:10,padding:"10px 12px",marginBottom:14}}>
+            {safetyNotices.map((n,i)=>(
+              <div key={i} style={{fontSize:12,color:"#e84c3d",lineHeight:1.6}}>⚠️ {n}</div>
+            ))}
+          </div>
+        )}
+
         <div style={{fontSize:16,fontWeight:700,color:"#fff",marginBottom:4}}>🎣 今おすすめの狙い</div>
         {updateStatus&&(
           <div style={{fontSize:11,marginBottom:10,
@@ -1200,14 +1442,14 @@ function TodayFishingView({activeSession,catches,fishMaster,recommendations,repo
         {recommendations.length===0?(
           <div style={{fontSize:12,color:"#6a9bb8",lineHeight:1.7,marginBottom:14}}>
             {reportsError?"最新釣果情報を取得できませんでした。自分の実績が増えると、ここに傾向が表示されます。"
-              :"現在利用できる最近の周辺釣果情報や自分の実績がまだありません。"}
+              :"おすすめを判断するデータが不足しています。自分の実績や周辺の釣果情報が増えると、ここに表示されます。"}
           </div>
         ):(
           <div style={{marginBottom:6}}>
             {recommendations.slice(0,3).map((rec,i)=>(
               <div key={rec.fishName}>
                 <div style={{fontSize:11,color:"#6a9bb8",marginBottom:2}}>{i+1}位</div>
-                <RecommendationCard rec={rec}/>
+                <RecommendationCard rec={rec} onStartFishingAt={onStartFishingAt}/>
               </div>
             ))}
           </div>
@@ -2189,6 +2431,7 @@ function App(){
   const [reportsError,setReportsError]=useState(false);
   const [reportsMalformed,setReportsMalformed]=useState(false);
   const [reportsUpdatedAt,setReportsUpdatedAt]=useState(null);
+  const [todayConditions,setTodayConditions]=useState(()=>loadStore(TODAYCONDITIONS_KEY,EMPTY_TODAY_CONDITIONS));
 
   useEffect(()=>{
     let cancelled=false;
@@ -2210,6 +2453,7 @@ function App(){
 
   useEffect(()=>{ saveStore(TARGET_PROFILES_KEY,{schemaVersion:1,profiles:targetProfiles}); },[targetProfiles]);
   useEffect(()=>{ saveStore(GEARPROFILE_KEY,gearProfile); },[gearProfile]);
+  useEffect(()=>{ saveStore(TODAYCONDITIONS_KEY,todayConditions); },[todayConditions]);
 
   useEffect(()=>{ saveStore(SESSION_KEY,{schemaVersion:1,session:activeSession}); },[activeSession]);
   useEffect(()=>{ saveStore(TRIPS_KEY,{schemaVersion:1,trips}); },[trips]);
@@ -2223,8 +2467,18 @@ function App(){
 
   const handleStartFishing=spot=>{
     if(activeSession&&!confirm("進行中のセッションがあります。終了して新しく開始しますか？"))return;
-    setActiveSession({...EMPTY_TRIP,id:uid(),spotId:spot.id,spotName:spot.name,
-      startAt:Date.now(),date:new Date().toISOString().slice(0,10)});
+    const today=new Date().toISOString().slice(0,10);
+    const inherited=todayConditions.date===today?{
+      weather:todayConditions.weather||"",
+      tide:todayConditions.tideType||"",
+      tideDirection:todayConditions.tideDirection||"",
+      turbidity:todayConditions.turbidity||"",
+      wind:todayConditions.windDirection&&todayConditions.windSpeedMs
+        ?`${todayConditions.windDirection} ${todayConditions.windSpeedMs}m/s`:(todayConditions.windDirection||""),
+      waves:todayConditions.wave||"",
+    }:{};
+    setActiveSession({...EMPTY_TRIP,...inherited,id:uid(),spotId:spot.id,spotName:spot.name,
+      startAt:Date.now(),date:today});
     setTab("today");
   };
 
@@ -2302,8 +2556,16 @@ function App(){
     handleCloseHomeMode();
   };
 
+  const handleSaveTodayConditions=patch=>setTodayConditions(patch);
+  const handleResetTodayConditions=()=>setTodayConditions(EMPTY_TODAY_CONDITIONS);
+
+  const todayStr=new Date().toISOString().slice(0,10);
+  const effectiveTodayConditions=todayConditions.date===todayStr?todayConditions:null;
+  const currentSpots=loadStore(LS_KEY,[]);
+
   const recommendations=getTargetRecommendations({
-    trips,catches,reports:externalReports,targetProfiles,gearProfile,now:Date.now(),
+    trips,catches,reports:externalReports,targetProfiles,gearProfile,
+    spots:currentSpots,todayConditions:effectiveTodayConditions,now:Date.now(),
   });
 
   return (
@@ -2323,6 +2585,8 @@ function App(){
           {tab==="today"&&<TodayFishingView activeSession={activeSession} catches={catches} fishMaster={fishMaster}
             recommendations={recommendations} reports={externalReports} reportsError={reportsError}
             reportsMalformed={reportsMalformed} reportsUpdatedAt={reportsUpdatedAt}
+            todayConditions={todayConditions} onSaveTodayConditions={handleSaveTodayConditions}
+            onResetTodayConditions={handleResetTodayConditions} onStartFishingAt={handleStartFishing}
             onSwitchToSpots={()=>setTab("spots")}
             onLogEvent={handleLogEvent} onLogCatch={handleLogCatch} onUpdateCatch={handleUpdateCatch}
             onEndSession={handleEndSession}
