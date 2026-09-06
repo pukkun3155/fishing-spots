@@ -1644,6 +1644,152 @@ function Modal({show,onClose,children}){
   );
 }
 
+// ── Phase 14: 🎯 魚から探す（魚種起点の検索。釣果予測ではなく、既存データの整理・提示） ──
+
+// 俗称として複数魚種を指しうる語のみを例外的に列挙する。fishMasterのaliasが偶然1魚種にしか
+// 登録されていなくても、ここに載る語は自動解決せず必ず候補確認を挟む（新しい推測モデルは作らない）。
+const AMBIGUOUS_FISH_ALIASES = { "タイ": ["マダイ","クロダイ"] };
+
+function normalizeFishSearchInput(query,fishMaster){
+  const q=(query||"").trim();
+  if(!q) return { status:"empty" };
+  if(AMBIGUOUS_FISH_ALIASES[q]){
+    return { status:"ambiguous", query:q, candidates:AMBIGUOUS_FISH_ALIASES[q] };
+  }
+  const exact=(fishMaster||[]).find(f=>f.name===q);
+  if(exact) return { status:"exact", query:q, fishName:exact.name };
+  const aliasMatches=(fishMaster||[]).filter(f=>(f.aliases||[]).includes(q));
+  if(aliasMatches.length===1) return { status:"alias", query:q, fishName:aliasMatches[0].name };
+  if(aliasMatches.length>1) return { status:"ambiguous", query:q, candidates:aliasMatches.map(f=>f.name) };
+  return { status:"unregistered", query:q, fishName:q };
+}
+
+function getFishSearchProfile(fishName,fishMaster,targetProfiles){
+  const master=(fishMaster||[]).find(f=>f.name===fishName)||null;
+  const profile=(targetProfiles||[]).find(p=>p.fishName===fishName)||null;
+  const hasRigInfo=!!(profile&&profile.recommendedMethods&&profile.recommendedMethods.length>0);
+  return { fishName, master, profile, registered:!!master, hasRigInfo };
+}
+
+// Phase10のgetPlanReportStatsをそのまま再利用し、船釣り情報は別枠（岸釣り実績としては絶対に使わない）で追加するのみ。
+function getFishRecentReportStats(reports,fishName,now){
+  const base=getPlanReportStats(reports,fishName,now);
+  const boatReports=(reports||[]).filter(r=>r.fishName===fishName&&r.fishingType==="boat")
+    .sort((a,b)=>new Date(b.reportedAt)-new Date(a.reportedAt));
+  const latestBoat=boatReports[0]||null;
+  const boatLastDays=latestBoat?daysAgo(latestBoat.reportedAt,now):null;
+  return { ...base, boatLastDays,
+    shoreFreshness:freshnessLabel(base.shoreLastDays), boatFreshness:freshnessLabel(boatLastDays) };
+}
+
+// bestSpotForFishと同じ2系統（釣果実績／スポットの手動タグ）を、1件だけでなく候補一覧として返す。
+// 「エリア」は該当スポットのareaを集計するだけで、GPSからの新しいエリア推定は行わない。
+function getFishSpotCandidates({fishName,trips,catches,spots}){
+  const tripSpotCount=new Map();
+  (catches||[]).filter(c=>c.fishName===fishName).forEach(c=>{
+    const trip=(trips||[]).find(t=>t.id===c.tripId);
+    if(trip&&trip.spotId) tripSpotCount.set(trip.spotId,(tripSpotCount.get(trip.spotId)||0)+1);
+  });
+  const taggedSpotIds=new Set(
+    (spots||[]).filter(s=>(s.fish||"").split(/[,、，]/).map(x=>x.trim()).includes(fishName)).map(s=>s.id)
+  );
+  const idSet=new Set([...tripSpotCount.keys(),...taggedSpotIds]);
+  const spotCandidates=[...idSet].map(id=>{
+    const spot=(spots||[]).find(s=>s.id===id);
+    if(!spot) return null;
+    return { spot, catchCount:tripSpotCount.get(id)||0, hasCatchHistory:tripSpotCount.has(id), tagged:taggedSpotIds.has(id) };
+  }).filter(Boolean).sort((a,b)=>b.catchCount-a.catchCount);
+
+  const areaMap=new Map();
+  spotCandidates.forEach(c=>{
+    const key=c.spot.area||"other";
+    if(!areaMap.has(key)) areaMap.set(key,{area:key,areaLabel:AREA_LABEL[key]||key,count:0});
+    areaMap.get(key).count++;
+  });
+  const areaCandidates=[...areaMap.values()].sort((a,b)=>b.count-a.count);
+  return { spotCandidates, areaCandidates };
+}
+
+// gearFitsをそのまま使い、重量はtargetProfiles.recommendedMethodsから動的に取る（魚名への重量ハードコードはしない）。
+function getFishRigCandidates(fishName,targetProfiles,gearProfile){
+  const profile=(targetProfiles||[]).find(p=>p.fishName===fishName)||null;
+  const methods=(profile&&profile.recommendedMethods)||[];
+  if(methods.length===0) return { registered:false, methods:[], anyFits:false, difficultyNote:"" };
+  const scored=methods.map(m=>({ ...m, fits:gearFits(m.typicalWeightG,gearProfile) }));
+  return { registered:true, methods:scored, anyFits:scored.some(m=>m.fits), difficultyNote:(profile&&profile.difficultyNote)||"" };
+}
+
+// Phase7のgetBriefingPersonalStatsをそのまま呼び出す薄いラッパー（Phase14専用の別集計は作らない）。
+function getFishPersonalStats({fishName,matchedSpot,trips,catches,todayConditions,now}){
+  return getBriefingPersonalStats({trips,catches,fishName,matchedSpot,todayConditions,now});
+}
+
+// getTargetRecommendations内のtodayConditions比較ロジックと同じフィールド・同じconditionMatchForFish呼び出しを
+// 1魚種分だけ切り出したもの。新しい判定基準は追加しない。
+function getFishTodayConditionSummary({fishName,todayConditions,trips,catches}){
+  if(!todayConditions||!todayConditions.date) return { available:false, reasons:[] };
+  const specs=[
+    ["weather","天気",todayConditions.weather,false],
+    ["tide","潮",todayConditions.tideType,false],
+    ["tideDirection","潮の動き",todayConditions.tideDirection,false],
+    ["wind","風向",todayConditions.windDirection,false],
+    ["waves","波",todayConditions.wave,todayConditions.wave==="高め"],
+    ["turbidity","濁り",todayConditions.turbidity,false],
+  ];
+  const reasons=[];
+  specs.forEach(([field,label,value,exclude])=>{
+    const m=conditionMatchForFish({trips,catches,fishName,field,value,excludeFromScoring:exclude});
+    if(!m) return;
+    if(m.bonus){
+      reasons.push({text:`${label}${value}：過去${m.count}回中${m.withCatch}回釣果あり`,positive:true});
+    }else if(exclude){
+      reasons.push({text:`${label}${value}：過去${m.count}回中${m.withCatch}回釣果あり（安全のためおすすめ度には反映していません）`,positive:false});
+    }else{
+      const l2=sampleLabel(m.count);
+      reasons.push({text:`${label}${value}：過去${m.count}回中${m.withCatch}回釣果あり${l2?`（${l2}）`:""}`,positive:false});
+    }
+  });
+  return { available:true, reasons };
+}
+
+// 候補スポット1件分の評価。安全条件（風速7m/s以上・波高1.0m以上・突風10m/s以上・雷）は他の材料に関わらず最優先。
+// 内部scoreは比較専用で、画面には「釣れる確率」等として一切出さない（Phase10のevaluatePlanCandidateと同じ方針）。
+function evaluateFishSpotCandidate({spotCandidate,fishName,weather,marine,reportStats,personalStats,rigInfo}){
+  const safetyBlockers=getPlanSafetyBlockers(weather,marine)||[];
+  if(safetyBlockers.length>0){
+    return { category:"caution", label:PLAN_CATEGORY_LABEL.caution, safetyBlockers, reasons:[], cautions:safetyBlockers, score:0 };
+  }
+  let score=0; const reasons=[]; const cautions=[];
+  if(spotCandidate.hasCatchHistory){ score+=2; reasons.push(`このポイントでの${fishName}実績あり（${spotCandidate.catchCount}回）`); }
+  else if(spotCandidate.tagged){ reasons.push("登録タグに基づく候補（実釣果の記録はまだありません）"); }
+  if(reportStats){
+    if(reportStats.shoreWithin7>0){ score+=2; reasons.push("直近7日以内の岸釣り情報あり"); }
+    else if(reportStats.shoreWithin30>0){ score+=1; reasons.push("直近30日以内の岸釣り情報あり"); }
+    else if(reportStats.shoreCount===0&&reportStats.boatCount>0){ cautions.push("最近の情報は船釣りのみで、岸からの実績情報は見つかっていません"); }
+  }
+  if(personalStats&&personalStats.tripCount>0){ score+=1; reasons.push(`自分の実績あり（${personalStats.tripCount}回）`); }
+  if(rigInfo&&rigInfo.registered){
+    if(rigInfo.anyFits){ score+=1; reasons.push("手持ちタックルで対応可"); }
+    else cautions.push("推奨される仕掛けが手持ちタックルの適合範囲外です");
+  }
+  const category=score>=4?"top":score>=2?"good":score>=1?"reference":"insufficient";
+  return { category, label:PLAN_CATEGORY_LABEL[category], safetyBlockers:[], reasons, cautions, score };
+}
+
+// 検索結果全体をUIが1回で受け取れるようまとめるだけの集約関数（新しい判定はしない）。
+function getFishSearchSummary({fishName,searchProfile,reportStats,spotResult,rigInfo,personalStats,todaySummary}){
+  const hasAnyData=!!(
+    (reportStats&&(reportStats.shoreCount>0||reportStats.boatCount>0))||
+    (spotResult&&spotResult.spotCandidates.length>0)||
+    (personalStats&&personalStats.tripCount>0)
+  );
+  return {
+    fishName, registered:searchProfile.registered, hasRigInfo:searchProfile.hasRigInfo, hasAnyData,
+    reportStats, spotCandidates:spotResult?spotResult.spotCandidates:[], areaCandidates:spotResult?spotResult.areaCandidates:[],
+    rigInfo, personalStats, todaySummary,
+  };
+}
+
 function EditModal({show,onClose,onSave,initial}){
   const [form,setForm]=useState(EMPTY);
   const [gpsLoading,setGpsLoading]=useState(false);
@@ -3605,11 +3751,191 @@ function MorningCheckCard({todayConditions,spots,targetProfiles,fishMaster,gearP
   );
 }
 
+// Phase14: 魚種起点の検索カード。判定ロジックは新設せず、既存の集計・安全判定関数を呼ぶだけ。新規localStorageなし（React stateのみ）。
+function FishSearchCard({todayConditions,spots,targetProfiles,gearProfile,fishMaster,trips,catches,reports,conditionsCache,onPlanHere,onOpenCompare}){
+  const [query,setQuery]=useState("");
+  const [resolvedFishName,setResolvedFishName]=useState(null);
+  const [ambiguous,setAmbiguous]=useState(null);
+  const [notice,setNotice]=useState("");
+
+  const runSearch=name=>{
+    const result=normalizeFishSearchInput(name,fishMaster);
+    if(result.status==="empty"){ setNotice("魚種名を入力してください。"); return; }
+    if(result.status==="ambiguous"){ setAmbiguous(result.candidates); setResolvedFishName(null); setNotice(""); return; }
+    setAmbiguous(null); setResolvedFishName(result.fishName); setNotice("");
+  };
+
+  const now=Date.now();
+  const searchProfile=resolvedFishName?getFishSearchProfile(resolvedFishName,fishMaster,targetProfiles):null;
+  const reportStats=resolvedFishName?getFishRecentReportStats(reports,resolvedFishName,now):null;
+  const spotResult=resolvedFishName?getFishSpotCandidates({fishName:resolvedFishName,trips,catches,spots}):null;
+  const rigInfo=resolvedFishName?getFishRigCandidates(resolvedFishName,targetProfiles,gearProfile):null;
+  const personalStats=resolvedFishName?getFishPersonalStats({fishName:resolvedFishName,matchedSpot:null,trips,catches,
+    todayConditions:{plannedStartTime:todayConditions.plannedStartTime},now}):null;
+  const todaySummary=resolvedFishName?getFishTodayConditionSummary({fishName:resolvedFishName,todayConditions,trips,catches}):null;
+
+  const todayStr=new Date().toISOString().slice(0,10);
+  const currentPlanActive=!!(todayConditions.spotId&&todayConditions.targetFish&&isConditionsActive(todayConditions.date,todayStr));
+
+  const handlePlanHere=(spotId,fishName)=>{
+    if(currentPlanActive){
+      const currentSpot=spots.find(s=>s.id===todayConditions.spotId);
+      if(!window.confirm(`現在の計画があります（${currentSpot?currentSpot.name:""} ${todayConditions.targetFish}）。上書きしますか？`)) return;
+    }
+    onPlanHere(spotId,fishName);
+    onOpenCompare();
+  };
+
+  return (
+    <div style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.12)",borderRadius:14,padding:"14px 14px 16px",marginBottom:14}}>
+      <div style={{fontSize:16,fontWeight:700,color:"#fff",marginBottom:8}}>🎯 魚から探す</div>
+      <div style={{display:"flex",gap:6,marginBottom:8}}>
+        <input value={query} onChange={e=>setQuery(e.target.value)}
+          onKeyDown={e=>{ if(e.key==="Enter") runSearch(query); }}
+          placeholder="魚種名（例：シロギス）"
+          style={{flex:1,padding:"9px 10px",borderRadius:8,border:"1px solid rgba(255,255,255,0.15)",
+            background:"rgba(255,255,255,0.05)",color:"#fff",fontSize:13}}/>
+        <button onClick={()=>runSearch(query)}
+          style={{padding:"9px 14px",borderRadius:8,border:"none",background:"#f5a623",color:"#1a0a00",fontSize:13,fontWeight:700,cursor:"pointer"}}>
+          検索
+        </button>
+      </div>
+      <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:10}}>
+        {(fishMaster||[]).map(f=>(
+          <button key={f.name} onClick={()=>{ setQuery(f.name); runSearch(f.name); }}
+            style={{fontSize:11,padding:"5px 10px",borderRadius:14,border:"1px solid rgba(255,255,255,0.15)",
+              background:resolvedFishName===f.name?"rgba(245,166,35,0.25)":"rgba(255,255,255,0.05)",
+              color:resolvedFishName===f.name?"#f5a623":"#d0e8f5",cursor:"pointer"}}>
+            {f.name}
+          </button>
+        ))}
+      </div>
+      {notice&&<div style={{fontSize:12,color:"#f5a623",marginBottom:8}}>{notice}</div>}
+
+      {ambiguous&&(
+        <div style={{background:"rgba(245,166,35,0.1)",border:"1px solid rgba(245,166,35,0.4)",borderRadius:10,padding:"10px 12px",marginBottom:10}}>
+          <div style={{fontSize:12,color:"#f5a623",marginBottom:6}}>「{query}」は複数の魚種を指す可能性があります。選んでください：</div>
+          <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+            {ambiguous.map(name=>(
+              <button key={name} onClick={()=>{ setResolvedFishName(name); setAmbiguous(null); }}
+                style={{fontSize:12,padding:"6px 12px",borderRadius:8,border:"1px solid rgba(245,166,35,0.5)",
+                  background:"rgba(245,166,35,0.2)",color:"#f5a623",cursor:"pointer"}}>
+                {name}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {resolvedFishName&&searchProfile&&(
+        <div>
+          <div style={{fontSize:15,fontWeight:700,color:"#fff",marginBottom:2}}>
+            {resolvedFishName}
+            {!searchProfile.registered&&<span style={{fontSize:11,color:"#6a9bb8",fontWeight:400}}>　（fishMaster未登録）</span>}
+          </div>
+          {!searchProfile.hasRigInfo&&(
+            <div style={{fontSize:12,color:"#6a9bb8",marginBottom:8}}>この魚種は仕掛け情報未登録です。</div>
+          )}
+
+          <div style={{fontSize:12,fontWeight:700,color:"#7ab3ff",margin:"10px 0 4px"}}>① おすすめのエリア・ポイント</div>
+          {spotResult&&spotResult.areaCandidates.length>0&&(
+            <div style={{fontSize:11,color:"#6a9bb8",marginBottom:6}}>
+              エリア：{spotResult.areaCandidates.map(a=>`${a.areaLabel}(${a.count})`).join("　")}
+            </div>
+          )}
+          {spotResult&&spotResult.spotCandidates.length>0?(
+            spotResult.spotCandidates.map(sc=>{
+              const spotConditionsMatch=conditionsCache&&conditionsCache.spotId===sc.spot.id;
+              const weather=spotConditionsMatch?conditionsCache.weather:null;
+              const marine=spotConditionsMatch?conditionsCache.marine:null;
+              const evalResult=evaluateFishSpotCandidate({spotCandidate:sc,fishName:resolvedFishName,weather,marine,reportStats,personalStats,rigInfo});
+              const catColor={top:"#2ecc87",good:"#7ab3ff",reference:"#6a9bb8",caution:"#e84c3d",insufficient:"#6a9bb8"}[evalResult.category];
+              return (
+                <div key={sc.spot.id} style={{background:"rgba(255,255,255,0.04)",border:`1px solid ${catColor}55`,borderRadius:10,padding:"9px 11px",marginBottom:6}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <span style={{fontSize:13,fontWeight:700,color:"#fff"}}>{sc.spot.name}</span>
+                    <span style={{fontSize:11,fontWeight:700,color:catColor}}>{evalResult.label}</span>
+                  </div>
+                  <div style={{fontSize:11,color:"#6a9bb8",marginBottom:4}}>
+                    {AREA_LABEL[sc.spot.area]||sc.spot.area||""}
+                    {sc.hasCatchHistory?`　実績あり（${sc.catchCount}回）`:sc.tagged?"　登録タグのみ":""}
+                  </div>
+                  {!spotConditionsMatch&&(
+                    <div style={{fontSize:10,color:"#6a9bb8",marginBottom:4}}>🌤 今日の天気・波データ：このポイントは未取得（朝チェックで取得すると表示されます）</div>
+                  )}
+                  {evalResult.reasons.map((r,i)=><div key={i} style={{fontSize:11,color:"#d0e8f5",marginBottom:2}}>・{r}</div>)}
+                  {evalResult.cautions.map((c,i)=><div key={i} style={{fontSize:11,color:"#f5a623",marginBottom:2}}>⚠ {c}</div>)}
+                  <button onClick={()=>handlePlanHere(sc.spot.id,resolvedFishName)}
+                    style={{width:"100%",marginTop:6,padding:"7px 8px",borderRadius:8,border:"1px solid rgba(245,166,35,0.4)",
+                      background:"rgba(245,166,35,0.15)",color:"#f5a623",fontSize:12,fontWeight:700,cursor:"pointer"}}>
+                    📅 この場所で計画する
+                  </button>
+                </div>
+              );
+            })
+          ):(
+            <div style={{fontSize:12,color:"#6a9bb8",marginBottom:8}}>登録スポット・釣行記録の中に候補が見つかりませんでした。</div>
+          )}
+
+          <div style={{fontSize:12,fontWeight:700,color:"#7ab3ff",margin:"10px 0 4px"}}>② 最近の釣果情報</div>
+          {reportStats&&(reportStats.shoreCount>0||reportStats.boatCount>0)?(
+            <div style={{fontSize:12,color:"#d0e8f5",marginBottom:8}}>
+              {reportStats.shoreCount>0?
+                <div>岸釣り：{reportStats.shoreCount}件（直近7日{reportStats.shoreWithin7}件・30日{reportStats.shoreWithin30}件）
+                  {reportStats.shoreFreshness&&`　最新：${reportStats.shoreLastDays}日前（${reportStats.shoreFreshness}）`}</div>
+                :<div>岸釣りの情報はまだありません。</div>}
+              {reportStats.boatCount>0&&
+                <div style={{color:"#6a9bb8"}}>船釣り情報：{reportStats.boatCount}件（参考・岸釣りの実績としては数えていません）
+                  {reportStats.boatFreshness&&`　最新：${reportStats.boatLastDays}日前（${reportStats.boatFreshness}）`}</div>}
+            </div>
+          ):(
+            <div style={{fontSize:12,color:"#6a9bb8",marginBottom:8}}>最近の釣果情報はまだありません。</div>
+          )}
+
+          <div style={{fontSize:12,fontWeight:700,color:"#7ab3ff",margin:"10px 0 4px"}}>③ 推奨仕掛け・タックル適合</div>
+          {rigInfo&&rigInfo.registered?(
+            <div style={{fontSize:12,color:"#d0e8f5",marginBottom:8}}>
+              {rigInfo.methods.map((m,i)=>(
+                <div key={i} style={{marginBottom:2}}>
+                  {m.name}{m.typicalWeightG>0?`（目安${m.typicalWeightG}g）`:""}
+                  <span style={{color:m.fits?"#2ecc87":"#e84c3d",fontWeight:700}}>{m.fits?"✓ 手持ちタックルで対応可":"✗ 手持ちタックルの範囲外"}</span>
+                </div>
+              ))}
+              {rigInfo.difficultyNote&&<div style={{fontSize:11,color:"#6a9bb8",marginTop:2}}>{rigInfo.difficultyNote}</div>}
+            </div>
+          ):(
+            <div style={{fontSize:12,color:"#6a9bb8",marginBottom:8}}>この魚種は仕掛け情報未登録です。</div>
+          )}
+
+          <div style={{fontSize:12,fontWeight:700,color:"#7ab3ff",margin:"10px 0 4px"}}>④ 本人実績</div>
+          {personalStats&&personalStats.tripCount>0?(
+            <div style={{fontSize:12,color:"#d0e8f5",marginBottom:8}}>
+              釣行{personalStats.tripCount}回中{personalStats.overall.withCatch}回釣果あり
+              {sampleLabel(personalStats.tripCount)&&<span style={{color:"#f5a623"}}>（{sampleLabel(personalStats.tripCount)}）</span>}
+            </div>
+          ):(
+            <div style={{fontSize:12,color:"#6a9bb8",marginBottom:8}}>自分の実績はまだありません。</div>
+          )}
+
+          <div style={{fontSize:12,fontWeight:700,color:"#7ab3ff",margin:"10px 0 4px"}}>⑤ 今日の条件との相性</div>
+          {todaySummary&&todaySummary.available&&todaySummary.reasons.length>0?(
+            <div style={{fontSize:12,color:"#d0e8f5"}}>
+              {todaySummary.reasons.map((r,i)=><div key={i} style={{marginBottom:2,color:r.positive?"#2ecc87":"#d0e8f5"}}>・{r.text}</div>)}
+            </div>
+          ):(
+            <div style={{fontSize:12,color:"#6a9bb8"}}>今日の条件が未入力、または参考になる過去記録がまだありません。</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function TodayFishingView({activeSession,catches,fishMaster,recommendations,reports,reportsError,reportsMalformed,reportsUpdatedAt,todayConditions,onSaveTodayConditions,onResetTodayConditions,onStartFishingAt,trips,spots,targetProfiles,gearProfile,gearTemplates,onSaveSkipLog,conditionsCache,autoFetchStatus,onFetchAutoConditions,onApplyAutoField,tideCache,autoTideStatus,onFetchTide,onSwitchToSpots,onLogEvent,onLogCatch,onUpdateCatch,onEndSession,onOpenHomeMode,
   planCandidates,planForecastCache,planFetchStatus,onFetchOnePlanForecast,onFetchAllPlanForecasts,
   onAddPlanCandidate,onUpdatePlanCandidate,onDeletePlanCandidate,onDuplicatePlanCandidate,onAdoptPlanCandidate,adoptedPlan,
   onFetchPlanTide,morningCheck,morningCheckStatus,onMorningCheckFetch,onApplyMorningForecast,onEnsureCandidateForCurrentPlan,
-  skipLogs}){
+  skipLogs,onPlanFishHere}){
   const [showEnd,setShowEnd]=useState(false);
   const [showCatch,setShowCatch]=useState(false);
   const [onsiteCatch,setOnsiteCatch]=useState(null);
@@ -3643,6 +3969,11 @@ function TodayFishingView({activeSession,catches,fishMaster,recommendations,repo
               onAdjustTime={()=>{ onEnsureCandidateForCurrentPlan(); setShowPlanCompare(true); }}
               onViewCandidates={()=>setShowPlanCompare(true)}
               collapsed={!morningDetailOpen} onToggleCollapsed={()=>setMorningDetailOpen(v=>!v)}/>
+            <FishSearchCard todayConditions={todayConditions} spots={spots} targetProfiles={targetProfiles}
+              gearProfile={gearProfile} fishMaster={fishMaster} trips={trips} catches={catches} reports={reports}
+              conditionsCache={conditionsCache}
+              onPlanHere={onPlanFishHere}
+              onOpenCompare={()=>setShowPlanCompare(true)}/>
           </>
         )}
         <button onClick={()=>setShowPlanCompare(v=>!v)}
@@ -5259,6 +5590,28 @@ function App(){
     });
   };
 
+  // Phase14:「📅 この場所で計画する」。todayConditionsのspotId/targetFishのみ設定し、Phase10の候補リストに
+  // 対応する候補が無ければ1件追加する（handleEnsureCandidateForCurrentPlanと同じ考え方だが、setTodayConditionsの
+  // 非同期反映を待たずに済むよう、渡された引数の値をそのまま使う）。上書き確認はFishSearchCard側で行う。
+  const handlePlanFishHere=(spotId,fishName)=>{
+    const dateStr=isConditionsActive(todayConditions.date,todayStr)?todayConditions.date:todayStr;
+    const startTime=isConditionsActive(todayConditions.date,todayStr)?todayConditions.plannedStartTime:"";
+    const durationMin=isConditionsActive(todayConditions.date,todayStr)?todayConditions.plannedDurationMin:"";
+    setTodayConditions(prev=>{
+      const base=isConditionsActive(prev.date,todayStr)?prev:{...EMPTY_TODAY_CONDITIONS,date:todayStr};
+      return {...base,spotId:spotId||"",targetFish:fishName||"",updatedAt:Date.now()};
+    });
+    setAdoptedPlan({fishName:fishName||null,spotId:spotId||null,nonce:Date.now()});
+    setPlanCandidates(prev=>{
+      const exists=prev.some(c=>c.spotId===spotId&&c.targetFish===fishName&&c.date===dateStr);
+      if(exists||prev.length>=MAX_PLAN_CANDIDATES) return prev;
+      return [...prev,{...EMPTY_PLAN_CANDIDATE,id:uid(),date:dateStr,
+        startTime:startTime||EMPTY_PLAN_CANDIDATE.startTime,
+        durationMin:durationMin||EMPTY_PLAN_CANDIDATE.durationMin,
+        spotId:spotId||"",targetFish:fishName||""}];
+    });
+  };
+
   const recommendations=getTargetRecommendations({
     trips,catches,reports:externalReports,targetProfiles,gearProfile,
     spots:currentSpots,todayConditions:effectiveTodayConditions,now:Date.now(),
@@ -5297,6 +5650,7 @@ function App(){
             morningCheck={morningCheck} morningCheckStatus={morningCheckStatus}
             onMorningCheckFetch={handleMorningCheckFetch} onApplyMorningForecast={handleApplyMorningForecast}
             onEnsureCandidateForCurrentPlan={handleEnsureCandidateForCurrentPlan}
+            onPlanFishHere={handlePlanFishHere}
             skipLogs={currentSkipLogs}
             onSwitchToSpots={()=>setTab("spots")}
             onLogEvent={handleLogEvent} onLogCatch={handleLogCatch} onUpdateCatch={handleUpdateCatch}
