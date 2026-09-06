@@ -4,6 +4,14 @@
 
 公開URL: https://pukkun3155.github.io/fishing-spots/
 
+## 天気・風・波の自動取得について
+
+「今日の条件」の天気・気温・風向・風速・波は、[Open-Meteo](https://open-meteo.com/)（Forecast API / Marine Weather API）から手動ボタン操作で取得できます。APIキーは使用していません。取得はボタン押下時のみで、ページ読み込み時の自動取得は行いません。
+
+取得した値は空欄のみを自動的に埋め、既に入力済みの値を無断で上書きすることはありません（異なる場合は比較表示のうえ、個別に「自動値を反映」を選んだ場合のみ反映されます）。潮回り・潮の動き・濁りは自動取得の対象外で、引き続き手入力です。
+
+Weather data by [Open-Meteo.com](https://open-meteo.com/) (CC BY 4.0)
+
 ## 最新釣果情報の更新方法
 
 `latest_reports.json` はアプリ起動時にfetchされる静的データです。**アプリ本体（`index.html`）を変更せず、このJSONファイルを更新してpushするだけ**で「今おすすめの狙い」「最近の周辺釣果」の内容を更新できます。

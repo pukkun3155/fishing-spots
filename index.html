@@ -389,6 +389,10 @@ const EMPTY_TODAY_CONDITIONS = {
   source:"manual", updatedAt:null,
 };
 
+function isConditionsActive(dateStr,todayStr){
+  return !!(dateStr&&dateStr>=todayStr);
+}
+
 function windSpeedLabel(ms){
   const n=parseFloat(ms);
   if(isNaN(n)) return null;
@@ -629,6 +633,161 @@ function getOverallVerdict({recommendations,safetyNotices}){
     return { level:"C", label:"△ 参考程度", summary:"最新の周辺情報・自分の実績とも少なめのため、参考程度の候補です。" };
   }
   return { level:"C", label:"△ 参考程度", summary:"データが少なめのため参考程度の候補です。" };
+}
+
+// ── Phase 8: 天気・風・波の自動取得（Open-Meteo、APIキー不要） ──
+
+const CONDITIONS_CACHE_KEY = "fishing_conditions_cache_v1";
+const WEATHER_API_BASE = "https://api.open-meteo.com/v1/forecast";
+const MARINE_API_BASE = "https://marine-api.open-meteo.com/v1/marine";
+const CACHE_FRESH_MIN = 30;
+const AUTO_FIELD_LABELS = { weather:"天気", temperatureC:"気温", windDirection:"風向", windSpeedMs:"風速", wave:"波" };
+
+function degToCompass8(deg){
+  if(deg==null||isNaN(deg)) return null;
+  const dirs=["北","北東","東","南東","南","南西","西","北西"];
+  const idx=Math.round((((deg%360)+360)%360)/45)%8;
+  return dirs[idx];
+}
+
+const WEATHER_CODE_LABEL_MAP={0:"晴れ",1:"晴れ",2:"曇り",3:"曇り",45:"曇り",48:"曇り",
+  51:"雨",53:"雨",55:"雨",56:"雨",57:"雨",61:"雨",63:"雨",65:"雨",66:"雨",67:"雨",
+  71:"雨",73:"雨",75:"雨",77:"雨",80:"雨",81:"雨",82:"雨",85:"雨",86:"雨",95:"雨",96:"雨",99:"雨"};
+function weatherCodeToLabel(code){ return code==null?null:(WEATHER_CODE_LABEL_MAP[code]||"不明"); }
+function weatherCodeHazard(code){
+  if(code==null) return null;
+  if([95,96,99].includes(code)) return "thunderstorm";
+  if([71,73,75,77,85,86].includes(code)) return "snow";
+  if([45,48].includes(code)) return "fog";
+  return null;
+}
+
+function waveHeightToLabel(m){
+  const n=parseFloat(m);
+  if(isNaN(n)) return null;
+  if(n<0.5) return "穏やか";
+  if(n<1.0) return "やや波あり";
+  return "高め";
+}
+
+function findClosestHourIndex(times,targetMs){
+  if(!Array.isArray(times)||times.length===0) return -1;
+  let bestIdx=-1,bestDiff=Infinity;
+  times.forEach((t,i)=>{
+    const tm=new Date(t).getTime();
+    if(isNaN(tm)) return;
+    const diff=Math.abs(tm-targetMs);
+    if(diff<bestDiff){ bestDiff=diff; bestIdx=i; }
+  });
+  return bestIdx;
+}
+
+function computeForecastForMs(dateStr,timeStr){
+  const time=timeStr||"06:00";
+  const t=new Date(`${dateStr}T${time}:00+09:00`).getTime();
+  return isNaN(t)?Date.now():t;
+}
+
+async function fetchAutoConditions({lat,lng,forecastForMs}){
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),10000);
+  const weatherUrl=`${WEATHER_API_BASE}?latitude=${lat}&longitude=${lng}&hourly=temperature_2m,precipitation,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m&wind_speed_unit=ms&timezone=Asia%2FTokyo&forecast_days=3`;
+  const marineUrl=`${MARINE_API_BASE}?latitude=${lat}&longitude=${lng}&hourly=wave_height,wave_direction,wave_period&timezone=Asia%2FTokyo&forecast_days=3`;
+
+  let weatherResult,marineResult;
+  try{
+    [weatherResult,marineResult]=await Promise.allSettled([
+      fetch(weatherUrl,{signal:controller.signal}).then(r=>{ if(!r.ok) throw new Error("weather http "+r.status); return r.json(); }),
+      fetch(marineUrl,{signal:controller.signal}).then(r=>{ if(!r.ok) throw new Error("marine http "+r.status); return r.json(); }),
+    ]);
+  }finally{
+    clearTimeout(timeout);
+  }
+
+  let weather=null,weatherError=null;
+  if(weatherResult.status==="fulfilled"){
+    const d=weatherResult.value;
+    const times=d&&d.hourly&&d.hourly.time;
+    const idx=findClosestHourIndex(times,forecastForMs);
+    if(idx>=0){
+      weather={
+        forecastTime:times[idx],
+        temperatureC:(d.hourly.temperature_2m||[])[idx]??null,
+        precipitationMm:(d.hourly.precipitation||[])[idx]??null,
+        weatherCode:(d.hourly.weather_code||[])[idx]??null,
+        windDirectionDeg:(d.hourly.wind_direction_10m||[])[idx]??null,
+        windSpeedMs:(d.hourly.wind_speed_10m||[])[idx]??null,
+        windGustMs:(d.hourly.wind_gusts_10m||[])[idx]??null,
+      };
+    }else weatherError="該当時刻の予報データがありません";
+  }else weatherError=String((weatherResult&&weatherResult.reason)||"取得失敗");
+
+  let marine=null,marineError=null;
+  if(marineResult.status==="fulfilled"){
+    const d=marineResult.value;
+    const times=d&&d.hourly&&d.hourly.time;
+    const idx=findClosestHourIndex(times,forecastForMs);
+    if(idx>=0){
+      marine={
+        forecastTime:times[idx],
+        waveHeightM:(d.hourly.wave_height||[])[idx]??null,
+        waveDirectionDeg:(d.hourly.wave_direction||[])[idx]??null,
+        wavePeriodSec:(d.hourly.wave_period||[])[idx]??null,
+      };
+    }else marineError="該当時刻の予報データがありません";
+  }else marineError=String((marineResult&&marineResult.reason)||"取得失敗");
+
+  return { weather, marine, weatherError, marineError };
+}
+
+function buildAutoFieldValues(weather,marine){
+  const vals={};
+  if(weather){
+    if(weather.temperatureC!=null) vals.temperatureC=String(Math.round(weather.temperatureC*10)/10);
+    const dir=degToCompass8(weather.windDirectionDeg);
+    if(dir) vals.windDirection=dir;
+    if(weather.windSpeedMs!=null) vals.windSpeedMs=String(Math.round(weather.windSpeedMs*10)/10);
+    const wLabel=weatherCodeToLabel(weather.weatherCode);
+    if(wLabel) vals.weather=wLabel;
+  }
+  if(marine&&marine.waveHeightM!=null){
+    const wv=waveHeightToLabel(marine.waveHeightM);
+    if(wv) vals.wave=wv;
+  }
+  return vals;
+}
+
+function mergeConditionsWithAuto(current,autoVals,opts){
+  const overwrite=!!(opts&&opts.overwrite);
+  const next={...current};
+  const filledFromAuto=[];
+  Object.entries(autoVals).forEach(([k,v])=>{
+    if(v==null) return;
+    const isEmpty=!current[k];
+    if(isEmpty||overwrite){
+      next[k]=v;
+      filledFromAuto.push(k);
+    }
+  });
+  return { next, filledFromAuto };
+}
+
+function getExtraSafetyNotices(cache){
+  const notices=[];
+  if(!cache) return notices;
+  if(cache.weather&&cache.weather.windGustMs!=null&&cache.weather.windGustMs>=10){
+    notices.push(`突風${Math.round(cache.weather.windGustMs*10)/10}m/s：突風に注意してください。`);
+  }
+  const hazard=cache.weather?weatherCodeHazard(cache.weather.weatherCode):null;
+  if(hazard==="thunderstorm"){
+    notices.push("雷の可能性があります。屋外・海辺では特に注意してください。");
+  }
+  return notices;
+}
+
+function formatCacheAgeMinutes(fetchedAt,now){
+  if(!fetchedAt) return null;
+  return Math.max(0,Math.floor((now-fetchedAt)/60000));
 }
 
 const EMPTY = {
@@ -1387,17 +1546,19 @@ function ReportsListView({reports}){
 
 function TodayConditionsCard({conditions,onSave,onReset,expanded,onToggleExpanded}){
   const today=new Date().toISOString().slice(0,10);
-  const isStale=!!(conditions.date&&conditions.date!==today);
-  const current=isStale?EMPTY_TODAY_CONDITIONS:conditions;
+  const isPast=!!(conditions.date&&conditions.date<today);
+  const current=isPast?EMPTY_TODAY_CONDITIONS:conditions;
 
   const set=(k,v)=>{
-    onSave({...current,[k]:v,date:today,source:"manual",updatedAt:Date.now()});
+    onSave({...current,[k]:v,date:current.date||today,source:"manual",updatedAt:Date.now()});
   };
 
   const windLabel=windSpeedLabel(current.windSpeedMs);
-  const hasAny=!isStale&&(current.weather||current.tideType||current.windSpeedMs||current.plannedStartTime||current.wave||current.turbidity);
+  const hasAny=!isPast&&(current.weather||current.tideType||current.windSpeedMs||current.plannedStartTime||current.wave||current.turbidity);
+  const isTomorrowPlan=current.date&&current.date>today;
 
   const summaryParts=[];
+  if(current.date) summaryParts.push(current.date===today?"今日":current.date);
   if(current.plannedStartTime) summaryParts.push(`開始${current.plannedStartTime}`);
   if(current.weather) summaryParts.push(current.weather);
   if(current.tideType) summaryParts.push(current.tideType);
@@ -1407,13 +1568,13 @@ function TodayConditionsCard({conditions,onSave,onReset,expanded,onToggleExpande
   return (
     <div style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:12,padding:"12px 14px",marginBottom:14}}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-        <span style={{fontSize:14,fontWeight:700,color:"#fff"}}>☀️ 今日の条件</span>
+        <span style={{fontSize:14,fontWeight:700,color:"#fff"}}>☀️ {isTomorrowPlan?"釣行予定日の条件":"今日の条件"}</span>
         <button onClick={onToggleExpanded}
           style={{fontSize:11,padding:"4px 10px",borderRadius:8,border:"1px solid rgba(255,255,255,0.15)",background:"transparent",color:"#6a9bb8",cursor:"pointer"}}>
           {expanded?"閉じる":hasAny?"編集":"入力する"}
         </button>
       </div>
-      {isStale&&(
+      {isPast&&(
         <div style={{fontSize:11,color:"#f5a623",marginTop:6}}>
           前回入力（{conditions.date}）の条件が残っています。今日の分を入力してください。
         </div>
@@ -1422,6 +1583,10 @@ function TodayConditionsCard({conditions,onSave,onReset,expanded,onToggleExpande
       {!expanded&&!hasAny&&<div style={{fontSize:11,color:"#6a9bb8",marginTop:6}}>未入力（未入力でも「今おすすめの狙い」は表示されます）</div>}
       {expanded&&(
         <div style={{marginTop:10}}>
+          <Field label="釣行予定日">
+            <Input type="date" min={today} value={current.date||today}
+              onChange={e=>onSave({...current,date:e.target.value,source:current.source||"manual",updatedAt:Date.now()})}/>
+          </Field>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
             <Field label="釣行予定開始時刻"><Input type="time" value={current.plannedStartTime} onChange={e=>set("plannedStartTime",e.target.value)}/></Field>
             <Field label="釣行予定時間（分）"><Input type="number" value={current.plannedDurationMin} onChange={e=>set("plannedDurationMin",e.target.value)}/></Field>
@@ -1517,19 +1682,20 @@ function SkipLogModal({show,onClose,onSave,snapshot}){
 }
 
 function BriefingView({recommendations,trips,catches,reports,targetProfiles,gearProfile,spots,gearTemplates,
-  todayConditions,reportsUpdatedAt,reportsError,reportsMalformed,onStartFishingAt,onOpenConditions,onSaveSkipLog}){
+  todayConditions,reportsUpdatedAt,reportsError,reportsMalformed,onStartFishingAt,onOpenConditions,onSaveSkipLog,
+  conditionsCache,autoFetchStatus,onFetchAutoConditions,onApplyAutoField}){
   const [overrideFishName,setOverrideFishName]=useState(null);
   const [overrideSpotId,setOverrideSpotId]=useState(null);
   const [showFishPicker,setShowFishPicker]=useState(false);
   const [showSpotPicker,setShowSpotPicker]=useState(false);
   const [showOthersDetail,setShowOthersDetail]=useState({});
   const [showSkip,setShowSkip]=useState(false);
+  const [showAutoDetail,setShowAutoDetail]=useState(false);
 
   const now=Date.now();
   const todayStr=new Date().toISOString().slice(0,10);
-  const effectiveConditions=todayConditions&&todayConditions.date===todayStr?todayConditions:null;
-  const safetyNotices=getTodaySafetyNotices(effectiveConditions);
-  const verdict=getOverallVerdict({recommendations,safetyNotices});
+  const effectiveConditions=isConditionsActive(todayConditions&&todayConditions.date,todayStr)?todayConditions:null;
+  const isTomorrowPlan=!!(effectiveConditions&&effectiveConditions.date>todayStr);
 
   const allCandidates=getTargetRecommendations({trips,catches,reports,targetProfiles,gearProfile,spots,
     todayConditions:effectiveConditions,now,includeIneligible:true});
@@ -1542,6 +1708,20 @@ function BriefingView({recommendations,trips,catches,reports,targetProfiles,gear
     effective={...effective,matchedSpot:overrideSpot};
   }
   const others=recommendations.filter(r=>r.fishName!==effectiveFishName).slice(0,2);
+
+  const planDateStr=(effectiveConditions&&effectiveConditions.date)||todayStr;
+  const planTimeStr=(effectiveConditions&&effectiveConditions.plannedStartTime)||"06:00";
+  const forecastForMs=computeForecastForMs(planDateStr,planTimeStr);
+  const targetSpotForFetch=effective?effective.matchedSpot:null;
+  const canAutoFetch=!!(targetSpotForFetch&&targetSpotForFetch.lat&&targetSpotForFetch.lng);
+  const cacheMatchesPlan=!!(conditionsCache&&targetSpotForFetch&&conditionsCache.spotId===targetSpotForFetch.id
+    &&conditionsCache.forecastFor===forecastForMs);
+  const cacheAgeMin=conditionsCache?formatCacheAgeMinutes(conditionsCache.fetchedAt,now):null;
+  const cacheIsFresh=cacheMatchesPlan&&cacheAgeMin!=null&&cacheAgeMin<=CACHE_FRESH_MIN;
+
+  const extraSafety=cacheMatchesPlan?getExtraSafetyNotices(conditionsCache):[];
+  const safetyNotices=[...getTodaySafetyNotices(effectiveConditions),...extraSafety];
+  const verdict=getOverallVerdict({recommendations,safetyNotices});
 
   const reportStats=effective?getBriefingReportStats(reports,effective.fishName,now):null;
   const personalStats=effective?getBriefingPersonalStats({trips,catches,fishName:effective.fishName,matchedSpot:effective.matchedSpot,todayConditions:effectiveConditions,now}):null;
@@ -1576,7 +1756,9 @@ function BriefingView({recommendations,trips,catches,reports,targetProfiles,gear
 
   return (
     <div style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.12)",borderRadius:14,padding:"14px 14px 16px",marginBottom:16}}>
-      <div style={{fontSize:16,fontWeight:700,color:"#fff",marginBottom:10}}>📋 釣行前ブリーフィング</div>
+      <div style={{fontSize:16,fontWeight:700,color:"#fff",marginBottom:10}}>
+        📋 {isTomorrowPlan?"明日":"今日"}の釣行前ブリーフィング
+      </div>
 
       {/* 1. 総合判断 */}
       <div style={{background:`rgba(255,255,255,0.05)`,border:`1px solid ${verdictColor}55`,borderRadius:10,padding:"10px 12px",marginBottom:12}}>
@@ -1675,6 +1857,91 @@ function BriefingView({recommendations,trips,catches,reports,targetProfiles,gear
                 {plannedEnd&&`・終了予定 ${plannedEnd.text}`}
               </div>
             )}
+            {effectiveConditions&&effectiveConditions.source&&effectiveConditions.source!=="manual"&&(
+              <div style={{fontSize:10,color:"#6a9bb8",marginTop:2}}>
+                {effectiveConditions.source==="auto"?"自動取得":"自動＋手入力"}
+              </div>
+            )}
+
+            <div style={{marginTop:8}}>
+              {!canAutoFetch?(
+                <div style={{fontSize:11,color:"#6a9bb8"}}>自動取得にはポイントの緯度経度が必要です</div>
+              ):(
+                <>
+                  <button onClick={()=>onFetchAutoConditions({spot:targetSpotForFetch,forecastForMs,planDateStr,planTimeStr})}
+                    disabled={autoFetchStatus&&autoFetchStatus.loading}
+                    style={{width:"100%",padding:"9px 8px",borderRadius:9,fontSize:12,fontWeight:600,
+                      cursor:autoFetchStatus&&autoFetchStatus.loading?"default":"pointer",
+                      background:"rgba(122,179,255,0.15)",border:"1px solid rgba(122,179,255,0.4)",color:"#7ab3ff"}}>
+                    {autoFetchStatus&&autoFetchStatus.loading?"取得中…":cacheMatchesPlan?"再取得":"☁️ 天気・風・波を取得"}
+                  </button>
+                  {cacheMatchesPlan&&(
+                    <div style={{fontSize:10,color:"#6a9bb8",marginTop:4}}>
+                      {cacheIsFresh?`✓ 予報取得済み（${cacheAgeMin}分前・${targetSpotForFetch.name}）`:`${cacheAgeMin}分前取得（古いキャッシュ・${targetSpotForFetch.name}）`}
+                    </div>
+                  )}
+                  {autoFetchStatus&&autoFetchStatus.error&&(
+                    <div style={{fontSize:11,color:"#e84c3d",marginTop:4}}>⚠️ {autoFetchStatus.error}</div>
+                  )}
+                  {cacheMatchesPlan&&(conditionsCache.weather||conditionsCache.marine)&&(
+                    <div style={{marginTop:6}}>
+                      <button onClick={()=>setShowAutoDetail(v=>!v)}
+                        style={{fontSize:11,color:"#6a9bb8",background:"none",border:"none",cursor:"pointer",padding:0}}>
+                        {showAutoDetail?"閉じる":"自動取得結果を見る"}
+                      </button>
+                      {showAutoDetail&&(
+                        <div style={{background:"rgba(255,255,255,0.05)",borderRadius:8,padding:"8px 10px",marginTop:6,fontSize:11,color:"#d0e8f5",lineHeight:1.8}}>
+                          <div style={{color:"#6a9bb8",marginBottom:4}}>
+                            予報地点：{targetSpotForFetch.name}（緯度{targetSpotForFetch.lat}・経度{targetSpotForFetch.lng}）<br/>
+                            対象時刻：{conditionsCache.weather?conditionsCache.weather.forecastTime:conditionsCache.marine?.forecastTime}
+                          </div>
+                          {conditionsCache.weather?(
+                            <>
+                              天気　{weatherCodeToLabel(conditionsCache.weather.weatherCode)||"—"}<br/>
+                              気温　{conditionsCache.weather.temperatureC!=null?conditionsCache.weather.temperatureC+"℃":"—"}<br/>
+                              風　{degToCompass8(conditionsCache.weather.windDirectionDeg)||""} {conditionsCache.weather.windSpeedMs!=null?conditionsCache.weather.windSpeedMs+"m/s":""}<br/>
+                              {conditionsCache.weather.windGustMs!=null&&<>突風　{conditionsCache.weather.windGustMs}m/s<br/></>}
+                              降水　{conditionsCache.weather.precipitationMm!=null?conditionsCache.weather.precipitationMm+"mm":"—"}<br/>
+                            </>
+                          ):conditionsCache.weatherError?(
+                            <div style={{color:"#e84c3d"}}>天気：{conditionsCache.weatherError}</div>
+                          ):null}
+                          {conditionsCache.marine?(
+                            <>
+                              波高　{conditionsCache.marine.waveHeightM!=null?conditionsCache.marine.waveHeightM+"m":"—"}<br/>
+                              波向　{degToCompass8(conditionsCache.marine.waveDirectionDeg)||"—"}<br/>
+                              波周期　{conditionsCache.marine.wavePeriodSec!=null?conditionsCache.marine.wavePeriodSec+"秒":"—"}<br/>
+                            </>
+                          ):conditionsCache.marineError?(
+                            <div style={{color:"#e84c3d"}}>波：{conditionsCache.marineError}</div>
+                          ):null}
+                          {(()=>{
+                            const autoVals=buildAutoFieldValues(conditionsCache.weather,conditionsCache.marine);
+                            const conflicts=Object.entries(autoVals).filter(([k,v])=>v!=null&&effectiveConditions&&effectiveConditions[k]&&effectiveConditions[k]!==v);
+                            if(conflicts.length===0) return null;
+                            return (
+                              <div style={{marginTop:8,paddingTop:8,borderTop:"1px solid rgba(255,255,255,0.1)"}}>
+                                <div style={{color:"#f5a623",marginBottom:4}}>手入力済みの値と異なります（自動上書きしません）：</div>
+                                {conflicts.map(([k,v])=>(
+                                  <div key={k} style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+                                    <span>{AUTO_FIELD_LABELS[k]}：自動{v} / 現在{effectiveConditions[k]}</span>
+                                    <button onClick={()=>onApplyAutoField(k,v)}
+                                      style={{fontSize:10,padding:"3px 8px",borderRadius:6,border:"1px solid rgba(245,166,35,0.4)",background:"transparent",color:"#f5a623",cursor:"pointer"}}>
+                                      自動値を反映
+                                    </button>
+                                  </div>
+                                ))}
+                              </div>
+                            );
+                          })()}
+                          <div style={{fontSize:9,color:"rgba(106,155,184,0.7)",marginTop:6}}>Weather data by Open-Meteo.com</div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
           </div>
 
           {/* 7. 安全チェック */}
@@ -1799,7 +2066,7 @@ function BriefingView({recommendations,trips,catches,reports,targetProfiles,gear
   );
 }
 
-function TodayFishingView({activeSession,catches,fishMaster,recommendations,reports,reportsError,reportsMalformed,reportsUpdatedAt,todayConditions,onSaveTodayConditions,onResetTodayConditions,onStartFishingAt,trips,spots,targetProfiles,gearProfile,gearTemplates,onSaveSkipLog,onSwitchToSpots,onLogEvent,onLogCatch,onUpdateCatch,onEndSession,onOpenHomeMode}){
+function TodayFishingView({activeSession,catches,fishMaster,recommendations,reports,reportsError,reportsMalformed,reportsUpdatedAt,todayConditions,onSaveTodayConditions,onResetTodayConditions,onStartFishingAt,trips,spots,targetProfiles,gearProfile,gearTemplates,onSaveSkipLog,conditionsCache,autoFetchStatus,onFetchAutoConditions,onApplyAutoField,onSwitchToSpots,onLogEvent,onLogCatch,onUpdateCatch,onEndSession,onOpenHomeMode}){
   const [showEnd,setShowEnd]=useState(false);
   const [showCatch,setShowCatch]=useState(false);
   const [onsiteCatch,setOnsiteCatch]=useState(null);
@@ -1815,7 +2082,9 @@ function TodayFishingView({activeSession,catches,fishMaster,recommendations,repo
           targetProfiles={targetProfiles} gearProfile={gearProfile} spots={spots} gearTemplates={gearTemplates}
           todayConditions={todayConditions} reportsUpdatedAt={reportsUpdatedAt} reportsError={reportsError}
           reportsMalformed={reportsMalformed} onStartFishingAt={onStartFishingAt}
-          onOpenConditions={()=>setShowConditions(true)} onSaveSkipLog={onSaveSkipLog}/>
+          onOpenConditions={()=>setShowConditions(true)} onSaveSkipLog={onSaveSkipLog}
+          conditionsCache={conditionsCache} autoFetchStatus={autoFetchStatus}
+          onFetchAutoConditions={onFetchAutoConditions} onApplyAutoField={onApplyAutoField}/>
 
         <TodayConditionsCard conditions={todayConditions} onSave={onSaveTodayConditions} onReset={onResetTodayConditions}
           expanded={showConditions} onToggleExpanded={()=>setShowConditions(v=>!v)}/>
@@ -2796,6 +3065,8 @@ function App(){
   const [reportsMalformed,setReportsMalformed]=useState(false);
   const [reportsUpdatedAt,setReportsUpdatedAt]=useState(null);
   const [todayConditions,setTodayConditions]=useState(()=>loadStore(TODAYCONDITIONS_KEY,EMPTY_TODAY_CONDITIONS));
+  const [conditionsCache,setConditionsCache]=useState(()=>loadStore(CONDITIONS_CACHE_KEY,null));
+  const [autoFetchStatus,setAutoFetchStatus]=useState({loading:false,error:null});
 
   useEffect(()=>{
     let cancelled=false;
@@ -2818,6 +3089,7 @@ function App(){
   useEffect(()=>{ saveStore(TARGET_PROFILES_KEY,{schemaVersion:1,profiles:targetProfiles}); },[targetProfiles]);
   useEffect(()=>{ saveStore(GEARPROFILE_KEY,gearProfile); },[gearProfile]);
   useEffect(()=>{ saveStore(TODAYCONDITIONS_KEY,todayConditions); },[todayConditions]);
+  useEffect(()=>{ if(conditionsCache) saveStore(CONDITIONS_CACHE_KEY,conditionsCache); },[conditionsCache]);
 
   useEffect(()=>{ saveStore(SESSION_KEY,{schemaVersion:1,session:activeSession}); },[activeSession]);
   useEffect(()=>{ saveStore(TRIPS_KEY,{schemaVersion:1,trips}); },[trips]);
@@ -2929,8 +3201,42 @@ function App(){
   const handleSaveTodayConditions=patch=>setTodayConditions(patch);
   const handleResetTodayConditions=()=>setTodayConditions(EMPTY_TODAY_CONDITIONS);
 
+  const handleFetchAutoConditions=async({spot,forecastForMs,planDateStr,planTimeStr})=>{
+    if(!spot||!spot.lat||!spot.lng){
+      setAutoFetchStatus({loading:false,error:"自動取得にはポイントの緯度経度が必要です"});
+      return;
+    }
+    setAutoFetchStatus({loading:true,error:null});
+    try{
+      const {weather,marine,weatherError,marineError}=await fetchAutoConditions({lat:spot.lat,lng:spot.lng,forecastForMs});
+      if(!weather&&!marine){
+        setAutoFetchStatus({loading:false,error:"自動取得できませんでした。手入力のまま利用できます。"});
+        return;
+      }
+      setConditionsCache({schemaVersion:1,fetchedAt:Date.now(),forecastFor:forecastForMs,
+        spotId:spot.id,latitude:spot.lat,longitude:spot.lng,weather,marine,weatherError,marineError});
+
+      const autoVals=buildAutoFieldValues(weather,marine);
+      setTodayConditions(prev=>{
+        const base=isConditionsActive(prev.date,todayStr)?prev:{...EMPTY_TODAY_CONDITIONS,date:planDateStr};
+        const anyManualBefore=["weather","temperatureC","windDirection","windSpeedMs","wave"].some(k=>base[k]);
+        const {next,filledFromAuto}=mergeConditionsWithAuto(base,autoVals,{overwrite:false});
+        if(filledFromAuto.length===0) return {...base,date:base.date||planDateStr,plannedStartTime:base.plannedStartTime||planTimeStr};
+        return {...next,date:next.date||planDateStr,plannedStartTime:next.plannedStartTime||planTimeStr,
+          source:anyManualBefore?"mixed":"auto",updatedAt:Date.now()};
+      });
+      setAutoFetchStatus({loading:false,error:null});
+    }catch(e){
+      setAutoFetchStatus({loading:false,error:"自動取得できませんでした。手入力のまま利用できます。"});
+    }
+  };
+
+  const handleApplyAutoField=(field,value)=>{
+    setTodayConditions(prev=>({...prev,[field]:value,source:"mixed",updatedAt:Date.now()}));
+  };
+
   const todayStr=new Date().toISOString().slice(0,10);
-  const effectiveTodayConditions=todayConditions.date===todayStr?todayConditions:null;
+  const effectiveTodayConditions=isConditionsActive(todayConditions.date,todayStr)?todayConditions:null;
   const currentSpots=loadStore(LS_KEY,[]);
 
   const recommendations=getTargetRecommendations({
@@ -2959,6 +3265,8 @@ function App(){
             onResetTodayConditions={handleResetTodayConditions} onStartFishingAt={handleStartFishing}
             trips={trips} spots={currentSpots} targetProfiles={targetProfiles} gearProfile={gearProfile}
             gearTemplates={gearTemplates} onSaveSkipLog={handleSaveSkipLog}
+            conditionsCache={conditionsCache} autoFetchStatus={autoFetchStatus}
+            onFetchAutoConditions={handleFetchAutoConditions} onApplyAutoField={handleApplyAutoField}
             onSwitchToSpots={()=>setTab("spots")}
             onLogEvent={handleLogEvent} onLogCatch={handleLogCatch} onUpdateCatch={handleUpdateCatch}
             onEndSession={handleEndSession}
