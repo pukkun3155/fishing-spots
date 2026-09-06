@@ -790,8 +790,148 @@ function formatCacheAgeMinutes(fetchedAt,now){
   return Math.max(0,Math.floor((now-fetchedAt)/60000));
 }
 
+// ── Phase 9: 潮汐（気象庁 潮位表 テキストデータ版・公共データ利用規約1.0） ──
+const TIDE_CACHE_KEY = "fishing_tide_cache_v1";
+const TIDE_FRESH_HOURS = 24;
+const TIDE_SOURCE_PAGE_URL = "https://www.data.jma.go.jp/kaiyou/db/tide/suisan/index.php";
+// 静岡県東部・駿河湾〜伊豆周辺の気象庁公式観測地点候補（GPSからの自動推定はしない）
+const TIDE_STATION_CANDIDATES = [
+  {id:"UC", name:"内浦"},
+  {id:"SM", name:"清水港"},
+  {id:"Z5", name:"焼津"},
+  {id:"OM", name:"御前崎"},
+  {id:"Z4", name:"田子"},
+  {id:"G9", name:"石廊崎"},
+  {id:"D6", name:"下田"},
+  {id:"QK", name:"南伊豆"},
+];
+
+function tideTableUrl(stationId,year){
+  return `https://www.data.jma.go.jp/kaiyou/data/db/tide/suisan/txt/${year}/${stationId}.txt`;
+}
+
+// 気象庁公式フォーマット（readme.html）：1行136カラム固定長。
+// 1-72:毎時潮位(3桁×24) 73-78:年月日(2桁×3) 79-80:地点記号 81-108:満潮(時刻4桁+潮位3桁)×4 109-136:干潮×4
+function parseTideTxtLine(line){
+  if(!line||line.length<136) return null;
+  const dateStr=line.slice(72,78);
+  const highStr=line.slice(80,108);
+  const lowStr=line.slice(108,136);
+  const yy=parseInt(dateStr.slice(0,2),10);
+  const mm=parseInt(dateStr.slice(2,4),10);
+  const dd=parseInt(dateStr.slice(4,6),10);
+  if(isNaN(yy)||isNaN(mm)||isNaN(dd)) return null;
+  function parseEvents(s){
+    const out=[];
+    for(let i=0;i<4;i++){
+      const chunk=s.slice(i*7,i*7+7);
+      const t=chunk.slice(0,4), h=chunk.slice(4,7);
+      if(t.trim()===""||t==="9999") continue;
+      const th=parseInt(t.slice(0,2),10), tm=parseInt(t.slice(2,4),10);
+      const heightCm=parseInt(h,10);
+      if(isNaN(th)||isNaN(tm)||isNaN(heightCm)) continue;
+      out.push({time:`${String(th).padStart(2,"0")}:${String(tm).padStart(2,"0")}`, heightCm});
+    }
+    return out;
+  }
+  const dateOut=`${2000+yy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")}`;
+  return { dateStr:dateOut, highs:parseEvents(highStr), lows:parseEvents(lowStr) };
+}
+
+function findTideDayLine(text,dateStr){
+  const lines=text.split("\n");
+  for(const line of lines){
+    if(line.length<136) continue;
+    const parsed=parseTideTxtLine(line);
+    if(parsed&&parsed.dateStr===dateStr) return parsed;
+  }
+  return null;
+}
+
+async function fetchOfficialTide({stationId,dateStr}){
+  const year=parseInt(dateStr.slice(0,4),10);
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),10000);
+  try{
+    const res=await fetch(tideTableUrl(stationId,year),{signal:controller.signal});
+    if(!res.ok) throw new Error("tide http "+res.status);
+    const text=await res.text();
+    const day=findTideDayLine(text,dateStr);
+    if(!day) throw new Error("該当日の潮汐データが見つかりません");
+    return { highs:day.highs, lows:day.lows };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function minutesFromTimeStr(t){
+  if(!t) return null;
+  const parts=t.split(":");
+  if(parts.length!==2) return null;
+  const h=parseInt(parts[0],10), m=parseInt(parts[1],10);
+  if(isNaN(h)||isNaN(m)) return null;
+  return h*60+m;
+}
+
+function formatDurationMin(totalMin){
+  if(totalMin==null||isNaN(totalMin)||totalMin<0) return null;
+  const h=Math.floor(totalMin/60), m=totalMin%60;
+  if(h===0) return `${m}分`;
+  if(m===0) return `約${h}時間`;
+  return `約${h}時間${m}分`;
+}
+
+// 満潮・干潮の公式時刻のみから、予定時刻が上げ/下げどちらの区間にあるかを機械的に判定する。
+// 断定はせず「天文潮位上は」と併記して表示すること（実際の潮流・海況とは異なる場合がある）。
+function computeTideRelation(planTimeStr,highs,lows){
+  const planMin=minutesFromTimeStr(planTimeStr);
+  if(planMin==null) return null;
+  const events=[
+    ...(highs||[]).map(e=>({...e,kind:"high",min:minutesFromTimeStr(e.time)})),
+    ...(lows||[]).map(e=>({...e,kind:"low",min:minutesFromTimeStr(e.time)})),
+  ].filter(e=>e.min!=null).sort((a,b)=>a.min-b.min);
+  if(events.length===0) return null;
+
+  let prev=null, next=null;
+  events.forEach(e=>{
+    if(e.min<=planMin&&(!prev||e.min>prev.min)) prev=e;
+    if(e.min>=planMin&&(!next||e.min<next.min)) next=e;
+  });
+
+  let direction=null;
+  if(prev&&next&&prev.min!==next.min){
+    if(prev.kind==="low"&&next.kind==="high") direction="上げ";
+    else if(prev.kind==="high"&&next.kind==="low") direction="下げ";
+  }
+
+  const nextHigh=events.find(e=>e.kind==="high"&&e.min>=planMin)||null;
+  const nextLow=events.find(e=>e.kind==="low"&&e.min>=planMin)||null;
+
+  return { direction, nextHigh, nextLow, planMin };
+}
+
+// 表示専用の参考区分。過去の釣行実績との自動集計はまだ行わない（Phase9は表示・集計の入口まで）。
+function classifyTideBucket(planMin,highs,lows){
+  if(planMin==null) return null;
+  const withMin=(list,kind)=>(list||[]).map(e=>({kind,min:minutesFromTimeStr(e.time)})).filter(e=>e.min!=null);
+  const allHigh=withMin(highs,"high");
+  const allLow=withMin(lows,"low");
+  for(const h of allHigh){ if(Math.abs(planMin-h.min)<=60) return "満潮前後1時間以内"; }
+  for(const h of allHigh){
+    if(planMin<h.min&&h.min-planMin<=120) return "満潮前2時間以内";
+    if(planMin>h.min&&planMin-h.min<=120) return "満潮後2時間以内";
+  }
+  for(const l of allLow){ if(Math.abs(planMin-l.min)<=60) return "干潮前後1時間以内"; }
+  for(const l of allLow){
+    if(planMin<l.min&&l.min-planMin<=120) return "干潮前2時間以内";
+    if(planMin>l.min&&planMin-l.min<=120) return "干潮後2時間以内";
+  }
+  return null;
+}
+
 const EMPTY = {
   name:"", area:"", type:"", status:"tbc", star:0,
+  tideStationId:"", tideStationName:"",
   addr:"", lat:"", lng:"", fish:"", note:"",
   date: new Date().toISOString().slice(0,10),
   parking:false, toilet:false, paid:false, night:false, beginner:false, crowded:false,
@@ -940,6 +1080,19 @@ function EditModal({show,onClose,onSave,initial}){
         <Field label="緯度"><Input type="number" step="any" placeholder="35.1234" value={form.lat} onChange={e=>set("lat",e.target.value)}/></Field>
         <Field label="経度"><Input type="number" step="any" placeholder="138.9876" value={form.lng} onChange={e=>set("lng",e.target.value)}/></Field>
       </div>
+      <Field label="🌊 潮汐観測地点（気象庁・任意）">
+        <Sel value={form.tideStationId||""} onChange={e=>{
+          const st=TIDE_STATION_CANDIDATES.find(s=>s.id===e.target.value);
+          setForm(f=>({...f,tideStationId:st?st.id:"",tideStationName:st?st.name:""}));
+        }}>
+          <option value="">未設定</option>
+          {TIDE_STATION_CANDIDATES.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}
+        </Sel>
+        <div style={{fontSize:11,color:"#6a9bb8",marginTop:5,lineHeight:1.6,
+          padding:"7px 10px",background:"rgba(255,255,255,0.04)",borderRadius:7,border:"1px solid rgba(255,255,255,0.08)"}}>
+          設定すると釣行前ブリーフィングで気象庁 潮位表（満潮・干潮の予測時刻）を取得できます。駿河湾・伊豆エリアの公式地点のみ表示しています。GPSからの自動選択はしません。
+        </div>
+      </Field>
       <Field label="評価"><StarPicker value={form.star} onChange={v=>set("star",v)}/></Field>
       <Field label="設備・特徴">
         <div style={{display:"flex",flexWrap:"wrap",gap:8,marginTop:4}}>
@@ -1056,6 +1209,7 @@ function SpotCard({spot,onEdit,onDelete,onStartFishing}){
   if(spot.night)   tags.push("🌙夜OK");
   if(spot.beginner)tags.push("🐟初心者向け");
   if(spot.crowded) tags.push("👥混雑注意");
+  if(spot.tideStationId) tags.push("🌊"+(spot.tideStationName||spot.tideStationId));
   if(spot.fish) spot.fish.split(/[,、，]/).map(f=>f.trim()).filter(Boolean).forEach(f=>tags.push("🐠"+f));
 
   const aUrl=appleUrl(spot);
@@ -1683,7 +1837,8 @@ function SkipLogModal({show,onClose,onSave,snapshot}){
 
 function BriefingView({recommendations,trips,catches,reports,targetProfiles,gearProfile,spots,gearTemplates,
   todayConditions,reportsUpdatedAt,reportsError,reportsMalformed,onStartFishingAt,onOpenConditions,onSaveSkipLog,
-  conditionsCache,autoFetchStatus,onFetchAutoConditions,onApplyAutoField}){
+  conditionsCache,autoFetchStatus,onFetchAutoConditions,onApplyAutoField,
+  tideCache,autoTideStatus,onFetchTide}){
   const [overrideFishName,setOverrideFishName]=useState(null);
   const [overrideSpotId,setOverrideSpotId]=useState(null);
   const [showFishPicker,setShowFishPicker]=useState(false);
@@ -1718,6 +1873,18 @@ function BriefingView({recommendations,trips,catches,reports,targetProfiles,gear
     &&conditionsCache.forecastFor===forecastForMs);
   const cacheAgeMin=conditionsCache?formatCacheAgeMinutes(conditionsCache.fetchedAt,now):null;
   const cacheIsFresh=cacheMatchesPlan&&cacheAgeMin!=null&&cacheAgeMin<=CACHE_FRESH_MIN;
+
+  const planStationId=targetSpotForFetch?.tideStationId||null;
+  const planStationName=targetSpotForFetch?.tideStationName||null;
+  const canFetchTide=!!planStationId;
+  const tideCacheMatchesPlan=!!(tideCache&&planStationId&&tideCache.stationId===planStationId&&tideCache.date===planDateStr);
+  const tideCacheAgeMin=tideCache?formatCacheAgeMinutes(tideCache.fetchedAt,now):null;
+  const tideCacheIsFresh=tideCacheMatchesPlan&&tideCacheAgeMin!=null&&tideCacheAgeMin<=TIDE_FRESH_HOURS*60;
+  const tideRelation=tideCacheMatchesPlan?computeTideRelation(planTimeStr,tideCache.highs,tideCache.lows):null;
+  const tideBucket=tideCacheMatchesPlan?classifyTideBucket(minutesFromTimeStr(planTimeStr),tideCache.highs,tideCache.lows):null;
+  const tideConflict=(tideCacheMatchesPlan&&tideRelation&&tideRelation.direction
+    &&effectiveConditions&&effectiveConditions.tideDirection&&effectiveConditions.tideDirection!==tideRelation.direction)
+    ?tideRelation.direction:null;
 
   const extraSafety=cacheMatchesPlan?getExtraSafetyNotices(conditionsCache):[];
   const safetyNotices=[...getTodaySafetyNotices(effectiveConditions),...extraSafety];
@@ -1944,6 +2111,72 @@ function BriefingView({recommendations,trips,catches,reports,targetProfiles,gear
             </div>
           </div>
 
+          {/* 4.5 潮汐 */}
+          <div style={{marginBottom:12}}>
+            <div style={{fontSize:12,color:"#6a9bb8",fontWeight:700,marginBottom:4}}>🌊 潮汐</div>
+            {!canFetchTide?(
+              <div style={{fontSize:11,color:"#6a9bb8",lineHeight:1.6}}>
+                このポイントには潮汐観測地点が設定されていません。「📍 ポイントを変更」の編集画面から設定できます。
+                <a href={TIDE_SOURCE_PAGE_URL} target="_blank" rel="noopener noreferrer" style={{color:"#7ab3ff",marginLeft:4}}>気象庁で確認</a>
+              </div>
+            ):(
+              <>
+                <button onClick={()=>onFetchTide({stationId:planStationId,stationName:planStationName,dateStr:planDateStr,planTimeStr})}
+                  disabled={autoTideStatus&&autoTideStatus.loading}
+                  style={{width:"100%",padding:"9px 8px",borderRadius:9,fontSize:12,fontWeight:600,
+                    cursor:autoTideStatus&&autoTideStatus.loading?"default":"pointer",
+                    background:"rgba(122,179,255,0.15)",border:"1px solid rgba(122,179,255,0.4)",color:"#7ab3ff"}}>
+                  {autoTideStatus&&autoTideStatus.loading?"取得中…":tideCacheMatchesPlan?"再取得":"🌊 潮汐を取得"}
+                </button>
+                {tideCacheMatchesPlan&&(
+                  <div style={{fontSize:10,color:"#6a9bb8",marginTop:4}}>
+                    {tideCacheIsFresh
+                      ?`✓ 気象庁潮位表（${Math.floor(tideCacheAgeMin/60)}時間前・${planStationName}）`
+                      :`${Math.floor(tideCacheAgeMin/60)}時間前取得（古いキャッシュ・${planStationName}）`}
+                  </div>
+                )}
+                {autoTideStatus&&autoTideStatus.error&&(
+                  <div style={{fontSize:11,color:"#e84c3d",marginTop:4}}>⚠️ {autoTideStatus.error}</div>
+                )}
+                {tideCacheMatchesPlan&&(
+                  <div style={{background:"rgba(255,255,255,0.05)",borderRadius:8,padding:"8px 10px",marginTop:6,fontSize:12,color:"#d0e8f5",lineHeight:1.8}}>
+                    {tideCache.highs.length===0&&tideCache.lows.length===0?(
+                      <div style={{color:"#6a9bb8"}}>この日は満潮・干潮の予測がありません。</div>
+                    ):(
+                      <>
+                        {tideCache.highs.map((h,i)=><div key={"h"+i}>満潮 {h.time}（{h.heightCm}cm）</div>)}
+                        {tideCache.lows.map((l,i)=><div key={"l"+i}>干潮 {l.time}（{l.heightCm}cm）</div>)}
+                      </>
+                    )}
+                    {tideRelation&&(tideRelation.nextHigh||tideRelation.nextLow||tideRelation.direction)&&(
+                      <div style={{marginTop:6,paddingTop:6,borderTop:"1px solid rgba(255,255,255,0.1)"}}>
+                        {tideRelation.nextHigh&&<div>満潮まで{formatDurationMin(tideRelation.nextHigh.min-tideRelation.planMin)}</div>}
+                        {tideRelation.nextLow&&<div>干潮まで{formatDurationMin(tideRelation.nextLow.min-tideRelation.planMin)}</div>}
+                        {tideRelation.direction&&<div>天文潮位上：{tideRelation.direction}</div>}
+                        {tideBucket&&<div style={{color:"#6a9bb8"}}>該当区分：{tideBucket}</div>}
+                      </div>
+                    )}
+                    {tideConflict&&(
+                      <div style={{marginTop:8,paddingTop:8,borderTop:"1px solid rgba(255,255,255,0.1)"}}>
+                        <div style={{color:"#f5a623",marginBottom:4}}>手入力済みの値と異なります（自動上書きしません）：</div>
+                        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                          <span>潮の動き：自動{tideConflict} / 現在{effectiveConditions.tideDirection}</span>
+                          <button onClick={()=>onApplyAutoField("tideDirection",tideConflict)}
+                            style={{fontSize:10,padding:"3px 8px",borderRadius:6,border:"1px solid rgba(245,166,35,0.4)",background:"transparent",color:"#f5a623",cursor:"pointer"}}>
+                            自動値を反映
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                    <div style={{fontSize:9,color:"rgba(106,155,184,0.7)",marginTop:6}}>
+                      潮汐データ：気象庁 天文潮位（<a href={tideCache.sourceUrl} target="_blank" rel="noopener noreferrer" style={{color:"rgba(122,179,255,0.7)"}}>{tideCache.stationName}</a>）
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+
           {/* 7. 安全チェック */}
           <div style={{marginBottom:12}}>
             <div style={{fontSize:12,color:"#6a9bb8",fontWeight:700,marginBottom:4}}>🛟 安全チェック</div>
@@ -2066,7 +2299,7 @@ function BriefingView({recommendations,trips,catches,reports,targetProfiles,gear
   );
 }
 
-function TodayFishingView({activeSession,catches,fishMaster,recommendations,reports,reportsError,reportsMalformed,reportsUpdatedAt,todayConditions,onSaveTodayConditions,onResetTodayConditions,onStartFishingAt,trips,spots,targetProfiles,gearProfile,gearTemplates,onSaveSkipLog,conditionsCache,autoFetchStatus,onFetchAutoConditions,onApplyAutoField,onSwitchToSpots,onLogEvent,onLogCatch,onUpdateCatch,onEndSession,onOpenHomeMode}){
+function TodayFishingView({activeSession,catches,fishMaster,recommendations,reports,reportsError,reportsMalformed,reportsUpdatedAt,todayConditions,onSaveTodayConditions,onResetTodayConditions,onStartFishingAt,trips,spots,targetProfiles,gearProfile,gearTemplates,onSaveSkipLog,conditionsCache,autoFetchStatus,onFetchAutoConditions,onApplyAutoField,tideCache,autoTideStatus,onFetchTide,onSwitchToSpots,onLogEvent,onLogCatch,onUpdateCatch,onEndSession,onOpenHomeMode}){
   const [showEnd,setShowEnd]=useState(false);
   const [showCatch,setShowCatch]=useState(false);
   const [onsiteCatch,setOnsiteCatch]=useState(null);
@@ -2084,7 +2317,8 @@ function TodayFishingView({activeSession,catches,fishMaster,recommendations,repo
           reportsMalformed={reportsMalformed} onStartFishingAt={onStartFishingAt}
           onOpenConditions={()=>setShowConditions(true)} onSaveSkipLog={onSaveSkipLog}
           conditionsCache={conditionsCache} autoFetchStatus={autoFetchStatus}
-          onFetchAutoConditions={onFetchAutoConditions} onApplyAutoField={onApplyAutoField}/>
+          onFetchAutoConditions={onFetchAutoConditions} onApplyAutoField={onApplyAutoField}
+          tideCache={tideCache} autoTideStatus={autoTideStatus} onFetchTide={onFetchTide}/>
 
         <TodayConditionsCard conditions={todayConditions} onSave={onSaveTodayConditions} onReset={onResetTodayConditions}
           expanded={showConditions} onToggleExpanded={()=>setShowConditions(v=>!v)}/>
@@ -3067,6 +3301,8 @@ function App(){
   const [todayConditions,setTodayConditions]=useState(()=>loadStore(TODAYCONDITIONS_KEY,EMPTY_TODAY_CONDITIONS));
   const [conditionsCache,setConditionsCache]=useState(()=>loadStore(CONDITIONS_CACHE_KEY,null));
   const [autoFetchStatus,setAutoFetchStatus]=useState({loading:false,error:null});
+  const [tideCache,setTideCache]=useState(()=>loadStore(TIDE_CACHE_KEY,null));
+  const [autoTideStatus,setAutoTideStatus]=useState({loading:false,error:null});
 
   useEffect(()=>{
     let cancelled=false;
@@ -3090,6 +3326,7 @@ function App(){
   useEffect(()=>{ saveStore(GEARPROFILE_KEY,gearProfile); },[gearProfile]);
   useEffect(()=>{ saveStore(TODAYCONDITIONS_KEY,todayConditions); },[todayConditions]);
   useEffect(()=>{ if(conditionsCache) saveStore(CONDITIONS_CACHE_KEY,conditionsCache); },[conditionsCache]);
+  useEffect(()=>{ if(tideCache) saveStore(TIDE_CACHE_KEY,tideCache); },[tideCache]);
 
   useEffect(()=>{ saveStore(SESSION_KEY,{schemaVersion:1,session:activeSession}); },[activeSession]);
   useEffect(()=>{ saveStore(TRIPS_KEY,{schemaVersion:1,trips}); },[trips]);
@@ -3219,7 +3456,7 @@ function App(){
       const autoVals=buildAutoFieldValues(weather,marine);
       setTodayConditions(prev=>{
         const base=isConditionsActive(prev.date,todayStr)?prev:{...EMPTY_TODAY_CONDITIONS,date:planDateStr};
-        const anyManualBefore=["weather","temperatureC","windDirection","windSpeedMs","wave"].some(k=>base[k]);
+        const anyManualBefore=["weather","temperatureC","windDirection","windSpeedMs","wave","tideDirection"].some(k=>base[k]);
         const {next,filledFromAuto}=mergeConditionsWithAuto(base,autoVals,{overwrite:false});
         if(filledFromAuto.length===0) return {...base,date:base.date||planDateStr,plannedStartTime:base.plannedStartTime||planTimeStr};
         return {...next,date:next.date||planDateStr,plannedStartTime:next.plannedStartTime||planTimeStr,
@@ -3233,6 +3470,34 @@ function App(){
 
   const handleApplyAutoField=(field,value)=>{
     setTodayConditions(prev=>({...prev,[field]:value,source:"mixed",updatedAt:Date.now()}));
+  };
+
+  const handleFetchTide=async({stationId,stationName,dateStr,planTimeStr})=>{
+    if(!stationId){
+      setAutoTideStatus({loading:false,error:"潮汐取得には観測地点の設定が必要です"});
+      return;
+    }
+    setAutoTideStatus({loading:true,error:null});
+    try{
+      const {highs,lows}=await fetchOfficialTide({stationId,dateStr});
+      setTideCache({schemaVersion:1,fetchedAt:Date.now(),date:dateStr,stationId,stationName,
+        sourceName:"気象庁",sourceUrl:TIDE_SOURCE_PAGE_URL,
+        highs,lows,forecastFor:dateStr,sourceType:"official"});
+
+      const rel=computeTideRelation(planTimeStr,highs,lows);
+      if(rel&&rel.direction){
+        setTodayConditions(prev=>{
+          const base=isConditionsActive(prev.date,todayStr)?prev:{...EMPTY_TODAY_CONDITIONS,date:dateStr};
+          if(base.tideDirection) return base; // 手入力済みの潮の動きは無断上書きしない
+          const anyManualBefore=["weather","temperatureC","windDirection","windSpeedMs","wave","tideDirection"].some(k=>base[k]);
+          return {...base,date:base.date||dateStr,tideDirection:rel.direction,
+            source:anyManualBefore?"mixed":(base.source==="manual"?"auto":(base.source||"auto")),updatedAt:Date.now()};
+        });
+      }
+      setAutoTideStatus({loading:false,error:null});
+    }catch(e){
+      setAutoTideStatus({loading:false,error:"潮汐情報を取得できませんでした。気象庁の潮位表で確認するか、手入力してください。"});
+    }
   };
 
   const todayStr=new Date().toISOString().slice(0,10);
@@ -3267,6 +3532,7 @@ function App(){
             gearTemplates={gearTemplates} onSaveSkipLog={handleSaveSkipLog}
             conditionsCache={conditionsCache} autoFetchStatus={autoFetchStatus}
             onFetchAutoConditions={handleFetchAutoConditions} onApplyAutoField={handleApplyAutoField}
+            tideCache={tideCache} autoTideStatus={autoTideStatus} onFetchTide={handleFetchTide}
             onSwitchToSpots={()=>setTab("spots")}
             onLogEvent={handleLogEvent} onLogCatch={handleLogCatch} onUpdateCatch={handleUpdateCatch}
             onEndSession={handleEndSession}
