@@ -33,6 +33,7 @@ const FISHMASTER_KEY = "fishing_fishmaster_v1";
 const RECIPES_KEY = "fishing_recipes_v1";
 const MEALS_KEY = "fishing_meals_v1";
 const HOMEPROGRESS_KEY = "fishing_home_progress_v1";
+const ANALYTICS_KEY = "fishing_analytics_settings_v1";
 const UNKNOWN_FISH = "魚種不明";
 
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
@@ -170,6 +171,120 @@ function recommendRecipes(recipes,fishName,sizeCm){
   const order=cat&&SIZE_RECIPE_PRIORITY[cat];
   if(!order) return matched;
   return [...matched].sort((a,b)=>order.indexOf(a.id)-order.indexOf(b.id));
+}
+
+// ── Phase 3: 分析集計関数（UIから分離。Phase4で再利用する前提） ──
+
+function filterTripsByPeriod(trips,period){
+  if(period==="all") return trips;
+  const now=Date.now();
+  let from;
+  if(period==="30d") from=now-30*24*60*60*1000;
+  else if(period==="year"){ const d=new Date(); d.setMonth(0,1); d.setHours(0,0,0,0); from=d.getTime(); }
+  else return trips;
+  return trips.filter(t=>{
+    const ts=t.startAt||(t.date?new Date(t.date+"T00:00:00").getTime():null);
+    return ts==null?true:ts>=from;
+  });
+}
+
+function sampleLabel(n){
+  if(!n||n<=0) return null;
+  if(n<=2) return "かなり少ない";
+  if(n<=4) return "まだ参考程度";
+  return null;
+}
+
+function getTripStats(trips){
+  const total=trips.length;
+  const withCatch=trips.filter(t=>(t.catchCount||0)>0).length;
+  const bouzu=trips.filter(t=>(t.catchCount||0)===0).length;
+  const withBite=trips.filter(t=>(t.biteCount||0)>0).length;
+  const totalCatch=trips.reduce((s,t)=>s+(t.catchCount||0),0);
+  const totalDurationMin=trips.reduce((s,t)=>s+(t.durationMin||0),0);
+  const catchPerHour=totalDurationMin>0?totalCatch/(totalDurationMin/60):null;
+  return { total, withCatch, bouzu, withBite, totalCatch, totalDurationMin, catchPerHour };
+}
+
+function getSpotStats(trips){
+  const map=new Map();
+  trips.forEach(t=>{
+    const key=t.spotId||("name:"+(t.spotName||"不明"));
+    if(!map.has(key)) map.set(key,{key,label:t.spotName||"（スポット不明）",trips:[]});
+    map.get(key).trips.push(t);
+  });
+  return [...map.values()]
+    .map(({key,label,trips})=>({key,label,...getTripStats(trips)}))
+    .sort((a,b)=>b.total-a.total);
+}
+
+function getFishStats(catches){
+  const map=new Map();
+  catches.forEach(c=>{
+    const key=c.fishName||UNKNOWN_FISH;
+    if(!map.has(key)) map.set(key,{fishName:key,totalCount:0,tripIds:new Set(),firstAt:null,lastAt:null});
+    const e=map.get(key);
+    e.totalCount+=c.count||0;
+    e.tripIds.add(c.tripId);
+    const t=c.caughtAt||0;
+    if(!e.firstAt||t<e.firstAt) e.firstAt=t;
+    if(!e.lastAt||t>e.lastAt) e.lastAt=t;
+  });
+  return [...map.values()]
+    .map(e=>({fishName:e.fishName,totalCount:e.totalCount,tripCount:e.tripIds.size,firstAt:e.firstAt,lastAt:e.lastAt}))
+    .sort((a,b)=>b.totalCount-a.totalCount);
+}
+
+const TIME_BUCKETS=[["early",4,7],["morning",7,10],["midday",10,15],["evening",15,18],["night",18,28]];
+const TIME_BUCKET_LABELS={early:"早朝（4-7時）",morning:"朝（7-10時）",midday:"昼（10-15時）",evening:"夕方（15-18時）",night:"夜（18-4時）"};
+function timeBucketOf(hour){
+  const h=hour<4?hour+24:hour;
+  for(const [key,start,end] of TIME_BUCKETS){ if(h>=start&&h<end) return key; }
+  return "night";
+}
+function getTimeStats(trips){
+  const buckets={early:[],morning:[],midday:[],evening:[],night:[]};
+  trips.forEach(t=>{
+    if(!t.startAt) return;
+    buckets[timeBucketOf(new Date(t.startAt).getHours())].push(t);
+  });
+  return Object.entries(buckets).map(([key,list])=>({key,label:TIME_BUCKET_LABELS[key],...getTripStats(list)}));
+}
+
+function getMonthlyStats(trips,catches){
+  const map=new Map();
+  trips.forEach(t=>{
+    const ym=(t.date||(t.startAt?new Date(t.startAt).toISOString().slice(0,10):"")).slice(0,7);
+    if(!ym) return;
+    if(!map.has(ym)) map.set(ym,[]);
+    map.get(ym).push(t);
+  });
+  return [...map.entries()].sort((a,b)=>b[0].localeCompare(a[0])).map(([ym,list])=>{
+    const tripIds=new Set(list.map(t=>t.id));
+    const monthCatches=catches.filter(c=>tripIds.has(c.tripId));
+    const fishCount=new Map();
+    monthCatches.forEach(c=>fishCount.set(c.fishName,(fishCount.get(c.fishName)||0)+(c.count||0)));
+    const topFish=[...fishCount.entries()].sort((a,b)=>b[1]-a[1]).slice(0,3).map(([n])=>n);
+    return {ym,...getTripStats(list),topFish};
+  });
+}
+
+const CONDITION_FIELDS=[["weather","天気"],["tide","潮回り"],["rig","仕掛け"],["bait","エサ"],["targetFish","対象魚"]];
+function getConditionStats(trips){
+  return CONDITION_FIELDS.map(([field,label])=>{
+    const groups=new Map();
+    trips.forEach(t=>{
+      const v=(t[field]||"").trim();
+      if(!v) return;
+      if(!groups.has(v)) groups.set(v,[]);
+      groups.get(v).push(t);
+    });
+    if(groups.size===0) return null;
+    const values=[...groups.entries()]
+      .map(([value,list])=>({value,...getTripStats(list)}))
+      .sort((a,b)=>b.total-a.total);
+    return {field,label,values};
+  }).filter(Boolean);
 }
 
 const EMPTY = {
@@ -966,12 +1081,244 @@ function TodayFishingView({activeSession,catches,fishMaster,onSwitchToSpots,onLo
   );
 }
 
-function AnalyticsPlaceholderView({tripsCount}){
+function RateBadge({num,den}){
+  const label=sampleLabel(den);
   return (
-    <div style={{padding:"48px 20px",textAlign:"center",color:"#6a9bb8",fontSize:13,lineHeight:2}}>
-      <div style={{fontSize:38,marginBottom:10}}>📊</div>
-      統計・分析機能は今後追加予定です。<br/>
-      現在の記録済み釣行：{tripsCount}件
+    <span style={{fontSize:10,color:"#6a9bb8"}}>
+      {den}回中{num}回{label&&<span style={{color:"#f5a623",marginLeft:4}}>（{label}）</span>}
+    </span>
+  );
+}
+
+function Bar({value,max,color}){
+  const pct=max>0?Math.min(100,Math.round((value/max)*100)):0;
+  return (
+    <div style={{background:"rgba(255,255,255,0.08)",borderRadius:6,height:8,overflow:"hidden",marginTop:6}}>
+      <div style={{width:`${pct}%`,height:"100%",background:color||"#f5a623",borderRadius:6}}/>
+    </div>
+  );
+}
+
+function StatCard({label,value}){
+  return (
+    <div style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:10,padding:"10px 6px",textAlign:"center"}}>
+      <div style={{fontSize:17,fontWeight:700,color:"#fff"}}>{value}</div>
+      <div style={{fontSize:10,color:"#6a9bb8",marginTop:2}}>{label}</div>
+    </div>
+  );
+}
+
+function RateCard({label,num,den}){
+  const pct=den>0?Math.round((num/den)*100):null;
+  return (
+    <div style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:10,padding:"10px 12px"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <span style={{fontSize:13,color:"#d0e8f5",fontWeight:600}}>{label}</span>
+        <span style={{fontSize:16,fontWeight:700,color:"#f5a623"}}>{pct!=null?`${pct}%`:"—"}</span>
+      </div>
+      <Bar value={num} max={den||1} color="#f5a623"/>
+      <div style={{marginTop:4}}><RateBadge num={num} den={den}/></div>
+    </div>
+  );
+}
+
+function SectionTitle({title}){
+  return <div style={{fontSize:13,fontWeight:700,color:"#fff",margin:"16px 0 8px"}}>{title}</div>;
+}
+function EmptyNote({text}){
+  return <div style={{fontSize:12,color:"#6a9bb8",marginBottom:16,lineHeight:1.7}}>{text}</div>;
+}
+
+function BasicDashboard({stats}){
+  const hours=stats.totalDurationMin>0?(stats.totalDurationMin/60).toFixed(1):null;
+  return (
+    <div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:10}}>
+        <StatCard label="総釣行回数" value={`${stats.total}回`}/>
+        <StatCard label="総釣行時間" value={hours?`${hours}h`:"未記録"}/>
+        <StatCard label="釣果あり" value={`${stats.withCatch}回`}/>
+        <StatCard label="ボウズ" value={`${stats.bouzu}回`}/>
+        <StatCard label="アタリあり" value={`${stats.withBite}回`}/>
+        <StatCard label="総釣果数" value={`${stats.totalCatch}匹`}/>
+      </div>
+      <div style={{display:"flex",flexDirection:"column",gap:8}}>
+        <RateCard label="釣果発生率" num={stats.withCatch} den={stats.total}/>
+        <RateCard label="アタリ発生率" num={stats.withBite} den={stats.total}/>
+        <div style={{fontSize:12,color:"#d0e8f5",background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:10,padding:"10px 12px"}}>
+          1時間あたり釣果数：{stats.catchPerHour!=null?`${stats.catchPerHour.toFixed(2)}匹/時`:"時間未記録のため算出不可"}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FishStatsSection({fishStats}){
+  if(fishStats.length===0) return <EmptyNote text="まだ釣果記録がありません。"/>;
+  const fmt=t=>t?new Date(t).toLocaleDateString("ja-JP"):"—";
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:8}}>
+      {fishStats.map(f=>(
+        <div key={f.fishName} style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:10,padding:"10px 12px"}}>
+          <div style={{display:"flex",justifyContent:"space-between"}}>
+            <span style={{fontSize:14,fontWeight:700,color:f.fishName===UNKNOWN_FISH?"#e84c3d":"#fff"}}>
+              {f.fishName===UNKNOWN_FISH?"❓ ":"🐟 "}{f.fishName}
+            </span>
+            <span style={{fontSize:13,color:"#f5a623",fontWeight:700}}>{f.totalCount}匹</span>
+          </div>
+          <div style={{fontSize:11,color:"#6a9bb8",marginTop:4}}>
+            釣れた釣行 {f.tripCount}回・初回 {fmt(f.firstAt)}・最近 {fmt(f.lastAt)}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function SpotStatsSection({spotStats}){
+  if(spotStats.length===0) return <EmptyNote text="まだ釣行記録がありません。"/>;
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:8}}>
+      {spotStats.map(s=>(
+        <div key={s.key} style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:10,padding:"10px 12px"}}>
+          <div style={{fontSize:14,fontWeight:700,color:"#fff"}}>{s.label}</div>
+          <div style={{fontSize:11,color:"#6a9bb8",marginTop:4}}>
+            釣行 {s.total}回・釣果あり {s.withCatch}回・ボウズ {s.bouzu}回・総釣果 {s.totalCatch}匹
+          </div>
+          <Bar value={s.withCatch} max={s.total} color="#2ecc87"/>
+          <div style={{marginTop:4,fontSize:11,color:"#d0e8f5"}}>
+            釣果発生率：{s.total>0?`${Math.round(s.withCatch/s.total*100)}%`:"—"}　<RateBadge num={s.withCatch} den={s.total}/>
+          </div>
+          <div style={{fontSize:11,color:"#6a9bb8",marginTop:2}}>
+            1時間あたり釣果数：{s.catchPerHour!=null?`${s.catchPerHour.toFixed(2)}匹/時`:"時間未記録"}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function TimeStatsSection({timeStats}){
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:8}}>
+      {timeStats.map(t=>(
+        <div key={t.key} style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:10,padding:"10px 12px"}}>
+          <div style={{display:"flex",justifyContent:"space-between"}}>
+            <span style={{fontSize:13,fontWeight:700,color:"#fff"}}>{t.label}</span>
+            <span style={{fontSize:12,color:"#6a9bb8"}}>{t.total>0?`釣行${t.total}回`:"記録なし"}</span>
+          </div>
+          {t.total>0&&(
+            <>
+              <Bar value={t.withCatch} max={t.total} color="#f5a623"/>
+              <div style={{fontSize:11,color:"#6a9bb8",marginTop:4}}>
+                釣果あり {t.withCatch}回・総釣果 {t.totalCatch}匹　<RateBadge num={t.withCatch} den={t.total}/>
+              </div>
+            </>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function MonthlyStatsSection({monthlyStats}){
+  if(monthlyStats.length===0) return <EmptyNote text="まだ月別に表示できる記録がありません。"/>;
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:8}}>
+      {monthlyStats.map(m=>(
+        <div key={m.ym} style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:10,padding:"10px 12px"}}>
+          <div style={{display:"flex",justifyContent:"space-between"}}>
+            <span style={{fontSize:13,fontWeight:700,color:"#fff"}}>{m.ym}</span>
+            <span style={{fontSize:12,color:"#6a9bb8"}}>釣行{m.total}回</span>
+          </div>
+          <div style={{fontSize:11,color:"#6a9bb8",marginTop:4}}>
+            釣果あり {m.withCatch}回・総釣果 {m.totalCatch}匹　<RateBadge num={m.withCatch} den={m.total}/>
+          </div>
+          {m.topFish.length>0&&<div style={{fontSize:11,color:"#d0e8f5",marginTop:4}}>主な魚種：{m.topFish.join("、")}</div>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ConditionStatsSection({conditionStats}){
+  if(conditionStats.length===0) return <EmptyNote text="条件別に集計できるデータがまだありません。"/>;
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:16}}>
+      {conditionStats.map(c=>(
+        <div key={c.field}>
+          <div style={{fontSize:12,color:"#6a9bb8",fontWeight:700,marginBottom:6}}>{c.label}</div>
+          <div style={{display:"flex",flexDirection:"column",gap:6}}>
+            {c.values.map(v=>(
+              <div key={v.value} style={{background:"rgba(255,255,255,0.05)",borderRadius:8,padding:"7px 10px"}}>
+                <div style={{display:"flex",justifyContent:"space-between",fontSize:12,color:"#d0e8f5"}}>
+                  <span>{v.value}</span><span>{v.total}回</span>
+                </div>
+                <Bar value={v.withCatch} max={v.total} color="#7ab3ff"/>
+                <div style={{fontSize:10,color:"#6a9bb8",marginTop:3}}>
+                  釣果あり {v.withCatch}回・総釣果 {v.totalCatch}匹　<RateBadge num={v.withCatch} den={v.total}/>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function AnalyticsView({trips,catches}){
+  const [period,setPeriod]=useState(()=>loadStore(ANALYTICS_KEY,{schemaVersion:1,period:"all"}).period);
+  useEffect(()=>{ saveStore(ANALYTICS_KEY,{schemaVersion:1,period}); },[period]);
+
+  if(trips.length===0){
+    return (
+      <div style={{padding:"48px 20px",textAlign:"center",color:"#6a9bb8",fontSize:13,lineHeight:2}}>
+        <div style={{fontSize:38,marginBottom:10}}>📊</div>
+        まだ統計を表示できる釣行記録がありません。<br/>
+        実際の釣行を記録すると、ここに傾向が表示されます。
+      </div>
+    );
+  }
+
+  const filteredTrips=filterTripsByPeriod(trips,period);
+  const filteredTripIds=new Set(filteredTrips.map(t=>t.id));
+  const filteredCatches=catches.filter(c=>filteredTripIds.has(c.tripId));
+  const periodChips=[["all","全期間"],["30d","直近30日"],["year","今年"]];
+
+  return (
+    <div style={{padding:"12px 14px",paddingBottom:80}}>
+      <div style={{fontSize:16,fontWeight:700,color:"#fff",marginBottom:10}}>📊 分析</div>
+      <div style={{display:"flex",gap:6,marginBottom:14}}>
+        {periodChips.map(([k,l])=>(
+          <button key={k} onClick={()=>setPeriod(k)}
+            style={{background:period===k?"#0d3a5c":"rgba(255,255,255,0.06)",
+              border:`1px solid ${period===k?"#f5a623":"rgba(255,255,255,0.1)"}`,
+              color:period===k?"#f5a623":"#6a9bb8",fontWeight:period===k?700:400,
+              borderRadius:20,padding:"5px 12px",fontSize:12,cursor:"pointer"}}>
+            {l}
+          </button>
+        ))}
+      </div>
+
+      {filteredTrips.length===0?(
+        <div style={{textAlign:"center",padding:"32px 16px",color:"#6a9bb8",fontSize:13,lineHeight:1.8}}>
+          この期間の釣行記録がありません。
+        </div>
+      ):(
+        <>
+          <BasicDashboard stats={getTripStats(filteredTrips)}/>
+          <SectionTitle title="🐟 魚種別"/>
+          <FishStatsSection fishStats={getFishStats(filteredCatches)}/>
+          <SectionTitle title="📍 ポイント別"/>
+          <SpotStatsSection spotStats={getSpotStats(filteredTrips)}/>
+          <SectionTitle title="🕐 時間帯別"/>
+          <TimeStatsSection timeStats={getTimeStats(filteredTrips)}/>
+          <SectionTitle title="📅 月別"/>
+          <MonthlyStatsSection monthlyStats={getMonthlyStats(filteredTrips,filteredCatches)}/>
+          <SectionTitle title="🎯 条件別"/>
+          <ConditionStatsSection conditionStats={getConditionStats(filteredTrips)}/>
+        </>
+      )}
     </div>
   );
 }
@@ -1672,7 +2019,7 @@ function App(){
             onLogEvent={handleLogEvent} onLogCatch={handleLogCatch} onUpdateCatch={handleUpdateCatch}
             onEndSession={handleEndSession}
             onOpenHomeMode={()=>activeSession&&handleOpenHomeMode(activeSession.id,`${activeSession.spotName||""} ${activeSession.date||""}`)}/>}
-          {tab==="stats"&&<AnalyticsPlaceholderView tripsCount={trips.length}/>}
+          {tab==="stats"&&<AnalyticsView trips={trips} catches={catches}/>}
           {tab==="trips"&&<TripLogView trips={trips} catches={catches} fishMaster={fishMaster}
             onUpdate={handleUpdateTrip} onDelete={handleDeleteTrip}
             onEditCatch={handleUpdateCatch} onDeleteCatch={handleDeleteCatch} onAddCatch={handleAddCatchToTrip}
