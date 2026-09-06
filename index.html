@@ -34,6 +34,9 @@ const RECIPES_KEY = "fishing_recipes_v1";
 const MEALS_KEY = "fishing_meals_v1";
 const HOMEPROGRESS_KEY = "fishing_home_progress_v1";
 const ANALYTICS_KEY = "fishing_analytics_settings_v1";
+const TARGET_PROFILES_KEY = "fishing_target_profiles_v1";
+const GEARPROFILE_KEY = "fishing_gear_profile_v1";
+const REPORTS_URL = "latest_reports.json";
 const UNKNOWN_FISH = "魚種不明";
 
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
@@ -133,6 +136,39 @@ const SEED_FISH_MASTER = [
     homeProcessing:["ウロコを取る","エラと内臓を取る","血合いを洗う","水分を拭き取る","冷蔵または冷凍"],
     recommendedRecipes:["刺身","塩焼き","昆布締め"] },
 ];
+
+// ── Phase 4: 初心者適性・岸釣り可否・推奨手法（既存fishMasterとは別データ） ──
+const SEED_TARGET_PROFILES = [
+  { fishName:"シロギス", beginnerFriendly:true, shoreTargetable:true,
+    recommendedMethods:[{name:"ちょい投げ",typicalWeightG:10}],
+    difficultyNote:"仕掛けがシンプルで扱いやすい。" },
+  { fishName:"アジ", beginnerFriendly:true, shoreTargetable:true,
+    recommendedMethods:[{name:"サビキ釣り",typicalWeightG:0}],
+    difficultyNote:"回遊に当たれば数釣りしやすい。" },
+  { fishName:"サバ", beginnerFriendly:true, shoreTargetable:true,
+    recommendedMethods:[{name:"サビキ釣り",typicalWeightG:0}],
+    difficultyNote:"引きは強いが処理は素早く。" },
+  { fishName:"イワシ", beginnerFriendly:true, shoreTargetable:true,
+    recommendedMethods:[{name:"サビキ釣り",typicalWeightG:0}],
+    difficultyNote:"群れが入れば数釣りしやすい。" },
+  { fishName:"カサゴ", beginnerFriendly:true, shoreTargetable:true,
+    recommendedMethods:[{name:"探り釣り",typicalWeightG:8},{name:"ワインド等ルアー",typicalWeightG:10}],
+    difficultyNote:"根周りを丁寧に探るのがコツ。" },
+  { fishName:"メバル", beginnerFriendly:false, shoreTargetable:true,
+    recommendedMethods:[{name:"探り釣り",typicalWeightG:5},{name:"ライトゲーム（ワーム）",typicalWeightG:5}],
+    difficultyNote:"時間帯や潮の影響を受けやすい。" },
+  { fishName:"クロダイ", beginnerFriendly:false, shoreTargetable:true,
+    recommendedMethods:[{name:"フカセ釣り",typicalWeightG:0},{name:"ヘチ釣り",typicalWeightG:5}],
+    difficultyNote:"警戒心が強くやや難易度が高い。" },
+  { fishName:"マダイ", beginnerFriendly:false, shoreTargetable:true,
+    recommendedMethods:[{name:"カゴ釣り",typicalWeightG:30},{name:"泳がせ釣り",typicalWeightG:25}],
+    difficultyNote:"堤防からは重めの仕掛け・遠投が必要になりやすい。" },
+];
+
+const SEED_GEAR_PROFILE = {
+  rods:[{id:"rod1",name:"SHIMANO Trastick S510-610L",lengthText:"1.8〜2.1m",lureWeightMinG:4,lureWeightMaxG:21}],
+  reels:[{id:"reel1",name:"SHIMANO 2500S"}],
+};
 
 const SEED_RECIPES = [
   { id:"r-shirogisu-tenpura", name:"天ぷら", fish:"シロギス", suitableSize:"小型〜中型（10〜20cm）",
@@ -285,6 +321,99 @@ function getConditionStats(trips){
       .sort((a,b)=>b.total-a.total);
     return {field,label,values};
   }).filter(Boolean);
+}
+
+// ── Phase 4: 最新周辺釣果 × 自分の実績 の「今おすすめの狙い」 ──
+
+function daysAgo(dateStr,now){
+  if(!dateStr) return null;
+  const t=new Date(dateStr+(dateStr.length<=10?"T00:00:00":"")).getTime();
+  if(isNaN(t)) return null;
+  return Math.floor((now-t)/(24*60*60*1000));
+}
+
+function freshnessLabel(days){
+  if(days==null) return null;
+  if(days<=7) return "新しい情報";
+  if(days<=14) return "やや新しい";
+  if(days<=30) return "参考情報";
+  return "古い情報";
+}
+
+function gearFits(methodWeightG,gearProfile){
+  if(methodWeightG==null||methodWeightG<=0) return true;
+  return (gearProfile.rods||[]).some(r=>methodWeightG>=r.lureWeightMinG&&methodWeightG<=r.lureWeightMaxG);
+}
+
+function getTargetRecommendations({trips,catches,reports,targetProfiles,gearProfile,now}){
+  now=now||Date.now();
+  const shoreReports=reports.filter(r=>r.fishingType==="shore");
+  const boatReports=reports.filter(r=>r.fishingType==="boat");
+  const nowMonth=new Date(now).getMonth();
+  const nowBucket=timeBucketOf(new Date(now).getHours());
+
+  const scored=targetProfiles.map(profile=>{
+    const fishName=profile.fishName;
+    const fishShore=shoreReports.filter(r=>r.fishName===fishName).sort((a,b)=>new Date(b.reportedAt)-new Date(a.reportedAt));
+    const fishBoat=boatReports.filter(r=>r.fishName===fishName).sort((a,b)=>new Date(b.reportedAt)-new Date(a.reportedAt));
+    const latestShore=fishShore[0]||null;
+    const latestBoat=fishBoat[0]||null;
+    const shoreDays=latestShore?daysAgo(latestShore.reportedAt,now):null;
+
+    const personalCatches=catches.filter(c=>c.fishName===fishName);
+    const personalTripIds=new Set(personalCatches.map(c=>c.tripId));
+    const personalTrips=trips.filter(t=>personalTripIds.has(t.id));
+    const personalCount=personalCatches.reduce((s,c)=>s+(c.count||0),0);
+    const personalTripCount=personalTripIds.size;
+
+    const monthMatch=personalTrips.some(t=>{
+      const d=t.date?new Date(t.date+"T00:00:00"):(t.startAt?new Date(t.startAt):null);
+      return d&&d.getMonth()===nowMonth;
+    });
+    const timeMatch=personalTrips.some(t=>t.startAt&&timeBucketOf(new Date(t.startAt).getHours())===nowBucket);
+
+    const methods=profile.recommendedMethods||[];
+    const fitMethod=methods.find(m=>gearFits(m.typicalWeightG,gearProfile))||null;
+
+    let score=0; const reasons=[];
+    if(shoreDays!=null){
+      if(shoreDays<=7){score+=3;reasons.push(`直近${shoreDays===0?"当日":shoreDays+"日前"}の岸釣りで釣果情報あり（${latestShore.sourceName}）`);}
+      else if(shoreDays<=14){score+=2;reasons.push(`${shoreDays}日前の岸釣り釣果情報あり（${latestShore.sourceName}）`);}
+      else if(shoreDays<=30){score+=1;reasons.push(`${shoreDays}日前の岸釣り釣果情報あり（参考情報・${latestShore.sourceName}）`);}
+      else{reasons.push(`岸釣り情報はありますが${shoreDays}日前とやや古めです（${latestShore.sourceName}）`);}
+    }else if(latestBoat){
+      score-=2;
+      reasons.push("最近の情報は船釣りのみで、岸からの実績情報は見つかっていません");
+    }
+    if(personalTripCount>0){
+      score+=2;
+      reasons.push(`自分の実績あり（釣行${personalTripCount}回・${personalCount}匹）`);
+    }
+    if(monthMatch){score+=1;reasons.push("今の時期（月）に自分で釣った実績あり");}
+    if(timeMatch){score+=1;reasons.push("この時間帯に自分で釣った実績あり");}
+    if(profile.beginnerFriendly){score+=1;reasons.push("初心者向け");}
+    if(profile.shoreTargetable){score+=1;reasons.push("岸から狙える");}
+    if(methods.length>0){
+      if(fitMethod){score+=2;reasons.push(`手持ちタックルで対応可（${fitMethod.name}）`);}
+      else reasons.push("推奨される仕掛けが手持ちタックルの適合範囲外です");
+    }
+    if(latestShore==null&&latestBoat==null&&personalTripCount===0){
+      reasons.push("外部情報・自分の実績のどちらもまだありません");
+    }else if(latestShore==null&&latestBoat==null&&personalTripCount>0){
+      reasons.push("外部の最新情報はまだ無く、自分の実績のみに基づく表示です");
+    }else if(personalTripCount===0&&(latestShore||latestBoat)){
+      reasons.push("自分の実績はまだ無く、周辺の外部情報のみに基づく表示です");
+    }
+
+    const stars=score<=1?1:score<=3?2:score<=5?3:score<=7?4:5;
+    const eligible=shoreDays!=null||!!latestBoat||personalTripCount>0;
+
+    return { fishName, score, stars, reasons, eligible,
+      latestShore, latestBoat, shoreDays, shoreFreshness:freshnessLabel(shoreDays),
+      personalTripCount, personalCount, gearFit:!fitMethod&&methods.length>0?false:true };
+  });
+
+  return scored.filter(s=>s.eligible).sort((a,b)=>b.score-a.score);
 }
 
 const EMPTY = {
@@ -947,24 +1076,123 @@ function OnsiteHandlingGuide({catchItem,fishMaster,onClose,onDone}){
   );
 }
 
-function TodayFishingView({activeSession,catches,fishMaster,onSwitchToSpots,onLogEvent,onLogCatch,onUpdateCatch,onEndSession,onOpenHomeMode}){
+function RecommendationCard({rec}){
+  return (
+    <div style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:12,padding:"12px 14px",marginBottom:10}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <span style={{fontSize:15,fontWeight:700,color:"#fff"}}>🐟 {rec.fishName}</span>
+        <span style={{fontSize:14,color:"#f5a623"}}>{"★".repeat(rec.stars)}{"☆".repeat(5-rec.stars)}</span>
+      </div>
+      <div style={{display:"flex",flexWrap:"wrap",gap:8,marginTop:6,fontSize:11,color:"#6a9bb8"}}>
+        <span>最近の周辺釣果：{rec.latestShore||rec.latestBoat?"あり":"なし"}</span>
+        <span>自分の実績：{rec.personalTripCount}回</span>
+        <span>データ鮮度：{rec.shoreFreshness?`${rec.shoreDays===0?"当日":rec.shoreDays+"日前"}（${rec.shoreFreshness}）`:"—"}</span>
+      </div>
+      <div style={{marginTop:8,display:"flex",flexDirection:"column",gap:3}}>
+        {rec.reasons.map((r,i)=>(
+          <div key={i} style={{fontSize:11,color:"#d0e8f5"}}>・{r}</div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ReportsListView({reports}){
+  const [filter,setFilter]=useState("all");
+  const filtered=reports.filter(r=>filter==="all"?true:r.fishingType===filter);
+  const chips=[["all","すべて"],["shore","岸釣り"],["boat","船釣り"]];
+  return (
+    <div>
+      <div style={{display:"flex",gap:6,marginBottom:12}}>
+        {chips.map(([k,l])=>(
+          <button key={k} onClick={()=>setFilter(k)}
+            style={{background:filter===k?"#0d3a5c":"rgba(255,255,255,0.06)",
+              border:`1px solid ${filter===k?"#f5a623":"rgba(255,255,255,0.1)"}`,
+              color:filter===k?"#f5a623":"#6a9bb8",fontWeight:filter===k?700:400,
+              borderRadius:20,padding:"5px 12px",fontSize:12,cursor:"pointer"}}>
+            {l}
+          </button>
+        ))}
+      </div>
+      {filtered.length===0?(
+        <div style={{fontSize:12,color:"#6a9bb8",lineHeight:1.7}}>該当する釣果情報がありません。</div>
+      ):(
+        <div style={{display:"flex",flexDirection:"column",gap:8}}>
+          {filtered.map(r=>{
+            const days=daysAgo(r.reportedAt,Date.now());
+            return (
+              <div key={r.id} style={{background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:10,padding:"10px 12px"}}>
+                <div style={{display:"flex",justifyContent:"space-between"}}>
+                  <span style={{fontSize:13,fontWeight:700,color:"#fff"}}>{r.fishName}</span>
+                  <span style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:10,
+                    background:r.fishingType==="boat"?"rgba(122,179,255,0.2)":"rgba(46,204,135,0.15)",
+                    color:r.fishingType==="boat"?"#7ab3ff":"#2ecc87"}}>
+                    {r.fishingType==="boat"?"🚤 船":"🏖 岸"}
+                  </span>
+                </div>
+                <div style={{fontSize:11,color:"#6a9bb8",marginTop:3}}>{r.area}・{r.spotName}・{r.reportedAt}（{freshnessLabel(days)}）</div>
+                <div style={{fontSize:11,color:"#6a9bb8",marginTop:2}}>{r.method}</div>
+                <div style={{fontSize:12,color:"#d0e8f5",marginTop:4}}>{r.catchSummary}</div>
+                <a href={r.sourceUrl} target="_blank" rel="noreferrer"
+                  style={{fontSize:11,color:"#f5a623",marginTop:6,display:"inline-block"}}>
+                  📎 {r.sourceName}
+                </a>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TodayFishingView({activeSession,catches,fishMaster,recommendations,reports,reportsError,onSwitchToSpots,onLogEvent,onLogCatch,onUpdateCatch,onEndSession,onOpenHomeMode}){
   const [showEnd,setShowEnd]=useState(false);
   const [showCatch,setShowCatch]=useState(false);
   const [onsiteCatch,setOnsiteCatch]=useState(null);
+  const [showReports,setShowReports]=useState(false);
   const [toast,setToast]=useState("");
   const flash=msg=>{ setToast(msg); clearTimeout(flash._t); flash._t=setTimeout(()=>setToast(""),1400); };
 
   if(!activeSession){
     return (
-      <div style={{padding:"48px 20px",textAlign:"center",color:"#6a9bb8",fontSize:13,lineHeight:2}}>
-        <div style={{fontSize:38,marginBottom:10}}>🎣</div>
-        進行中の釣行がありません。<br/>
-        「📍 ポイント」タブでスポットを選び、<br/>「🎣 ここで釣り開始」から始めましょう。
-        <div style={{marginTop:16}}>
-          <button onClick={onSwitchToSpots}
-            style={{background:"#f5a623",color:"#1a0a00",border:"none",borderRadius:10,padding:"10px 18px",fontSize:14,fontWeight:700,cursor:"pointer"}}>
-            📍 ポイントを選ぶ
-          </button>
+      <div style={{padding:"16px 14px"}}>
+        <div style={{fontSize:16,fontWeight:700,color:"#fff",marginBottom:10}}>🎣 今おすすめの狙い</div>
+        {recommendations.length===0?(
+          <div style={{fontSize:12,color:"#6a9bb8",lineHeight:1.7,marginBottom:14}}>
+            {reportsError?"最新釣果情報を取得できませんでした。自分の実績が増えると、ここに傾向が表示されます。"
+              :"現在利用できる最近の周辺釣果情報や自分の実績がまだありません。"}
+          </div>
+        ):(
+          <div style={{marginBottom:6}}>
+            {recommendations.slice(0,3).map((rec,i)=>(
+              <div key={rec.fishName}>
+                <div style={{fontSize:11,color:"#6a9bb8",marginBottom:2}}>{i+1}位</div>
+                <RecommendationCard rec={rec}/>
+              </div>
+            ))}
+          </div>
+        )}
+        {reportsError&&<div style={{fontSize:11,color:"#e84c3d",marginBottom:10}}>⚠️ 最新釣果情報を取得できませんでした</div>}
+
+        <button onClick={()=>setShowReports(v=>!v)}
+          style={{width:"100%",padding:"10px 8px",borderRadius:10,fontSize:13,fontWeight:600,cursor:"pointer",marginBottom:16,
+            background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.15)",color:"#d0e8f5"}}>
+          {showReports?"最近の周辺釣果を閉じる":"最近の周辺釣果を見る"}
+        </button>
+        {showReports&&<div style={{marginBottom:16}}><ReportsListView reports={reports}/></div>}
+
+        <div style={{textAlign:"center",padding:"24px 10px",color:"#6a9bb8",fontSize:13,lineHeight:2,
+          borderTop:"1px solid rgba(255,255,255,0.1)"}}>
+          <div style={{fontSize:32,marginBottom:8}}>🎣</div>
+          進行中の釣行がありません。<br/>
+          「📍 ポイント」タブでスポットを選び、<br/>「🎣 ここで釣り開始」から始めましょう。
+          <div style={{marginTop:16}}>
+            <button onClick={onSwitchToSpots}
+              style={{background:"#f5a623",color:"#1a0a00",border:"none",borderRadius:10,padding:"10px 18px",fontSize:14,fontWeight:700,cursor:"pointer"}}>
+              📍 ポイントを選ぶ
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -1908,6 +2136,34 @@ function App(){
   const [homeProgress,setHomeProgress]=useState(()=>loadStore(HOMEPROGRESS_KEY,{schemaVersion:1,progress:{}}).progress);
   const [homeModeTripId,setHomeModeTripId]=useState(null);
   const [homeModeTripLabel,setHomeModeTripLabel]=useState("");
+  const [targetProfiles,setTargetProfiles]=useState(()=>{
+    const store=loadStore(TARGET_PROFILES_KEY,null);
+    if(store===null){ saveStore(TARGET_PROFILES_KEY,{schemaVersion:1,profiles:SEED_TARGET_PROFILES}); return SEED_TARGET_PROFILES; }
+    return store.profiles;
+  });
+  const [gearProfile,setGearProfile]=useState(()=>{
+    const store=loadStore(GEARPROFILE_KEY,null);
+    if(store===null){ saveStore(GEARPROFILE_KEY,{schemaVersion:1,...SEED_GEAR_PROFILE}); return SEED_GEAR_PROFILE; }
+    return store;
+  });
+  const [externalReports,setExternalReports]=useState([]);
+  const [reportsError,setReportsError]=useState(false);
+
+  useEffect(()=>{
+    let cancelled=false;
+    fetch(REPORTS_URL).then(res=>{
+      if(!res.ok) throw new Error("fetch failed");
+      return res.json();
+    }).then(data=>{
+      if(!cancelled) setExternalReports(Array.isArray(data.reports)?data.reports:[]);
+    }).catch(()=>{
+      if(!cancelled){ setExternalReports([]); setReportsError(true); }
+    });
+    return ()=>{ cancelled=true; };
+  },[]);
+
+  useEffect(()=>{ saveStore(TARGET_PROFILES_KEY,{schemaVersion:1,profiles:targetProfiles}); },[targetProfiles]);
+  useEffect(()=>{ saveStore(GEARPROFILE_KEY,gearProfile); },[gearProfile]);
 
   useEffect(()=>{ saveStore(SESSION_KEY,{schemaVersion:1,session:activeSession}); },[activeSession]);
   useEffect(()=>{ saveStore(TRIPS_KEY,{schemaVersion:1,trips}); },[trips]);
@@ -2000,6 +2256,10 @@ function App(){
     handleCloseHomeMode();
   };
 
+  const recommendations=getTargetRecommendations({
+    trips,catches,reports:externalReports,targetProfiles,gearProfile,now:Date.now(),
+  });
+
   return (
     <div style={{background:"#061a2e",minHeight:"100vh",color:"#d0e8f5",paddingBottom:64}}>
       {homeModeTripId?(
@@ -2015,6 +2275,7 @@ function App(){
         <>
           {tab==="spots"&&<SpotsTab onStartFishing={handleStartFishing}/>}
           {tab==="today"&&<TodayFishingView activeSession={activeSession} catches={catches} fishMaster={fishMaster}
+            recommendations={recommendations} reports={externalReports} reportsError={reportsError}
             onSwitchToSpots={()=>setTab("spots")}
             onLogEvent={handleLogEvent} onLogCatch={handleLogCatch} onUpdateCatch={handleUpdateCatch}
             onEndSession={handleEndSession}
