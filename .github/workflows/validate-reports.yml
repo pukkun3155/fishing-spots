@@ -1,0 +1,25 @@
+name: Validate latest_reports.json
+
+# 目的は「壊れたJSONを公開しない」ことだけです。
+# 外部の釣果サイトへのアクセス・自動収集・スクレイピングは一切行いません。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "latest_reports.json"
+      - "tools/update_latest_reports.py"
+  pull_request:
+    paths:
+      - "latest_reports.json"
+      - "tools/update_latest_reports.py"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate latest_reports.json structure
+        run: python3 tools/update_latest_reports.py validate
+      - name: Run update_latest_reports unit tests
+        run: python3 -m unittest tools/test_update_latest_reports.py -v

@@ -332,6 +332,33 @@ function daysAgo(dateStr,now){
   return Math.floor((now-t)/(24*60*60*1000));
 }
 
+function sanitizeReportsPayload(raw){
+  if(!raw||typeof raw!=="object"||!Array.isArray(raw.reports)) return null;
+  const REQUIRED=["id","reportedAt","fishName","area","fishingType","sourceName","sourceUrl"];
+  const clean=raw.reports.filter(r=>r&&typeof r==="object"&&REQUIRED.every(k=>typeof r[k]==="string"&&r[k]));
+  return {
+    updatedAt: typeof raw.updatedAt==="string"?raw.updatedAt:null,
+    reports: clean,
+    malformedCount: raw.reports.length-clean.length,
+  };
+}
+
+function formatUpdatedAt(iso){
+  const d=new Date(iso);
+  if(isNaN(d.getTime())) return iso;
+  return d.toLocaleString("ja-JP",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"});
+}
+
+function reportsUpdateStatus(updatedAt,now){
+  if(!updatedAt) return null;
+  const d=daysAgo(updatedAt,now);
+  if(d==null) return null;
+  const when=formatUpdatedAt(updatedAt);
+  if(d<=7) return {level:"ok",text:`釣果情報 最終更新：${when}`};
+  if(d<=14) return {level:"warn",text:`釣果情報 最終更新：${when}（情報更新から${d}日経過）`};
+  return {level:"alert",text:`⚠️ 最近の釣果情報が古くなっています（最終更新：${when}、${d}日経過）`};
+}
+
 function freshnessLabel(days){
   if(days==null) return null;
   if(days<=7) return "新しい情報";
@@ -1146,7 +1173,7 @@ function ReportsListView({reports}){
   );
 }
 
-function TodayFishingView({activeSession,catches,fishMaster,recommendations,reports,reportsError,onSwitchToSpots,onLogEvent,onLogCatch,onUpdateCatch,onEndSession,onOpenHomeMode}){
+function TodayFishingView({activeSession,catches,fishMaster,recommendations,reports,reportsError,reportsMalformed,reportsUpdatedAt,onSwitchToSpots,onLogEvent,onLogCatch,onUpdateCatch,onEndSession,onOpenHomeMode}){
   const [showEnd,setShowEnd]=useState(false);
   const [showCatch,setShowCatch]=useState(false);
   const [onsiteCatch,setOnsiteCatch]=useState(null);
@@ -1155,9 +1182,21 @@ function TodayFishingView({activeSession,catches,fishMaster,recommendations,repo
   const flash=msg=>{ setToast(msg); clearTimeout(flash._t); flash._t=setTimeout(()=>setToast(""),1400); };
 
   if(!activeSession){
+    const updateStatus=reportsUpdateStatus(reportsUpdatedAt,Date.now());
     return (
       <div style={{padding:"16px 14px"}}>
-        <div style={{fontSize:16,fontWeight:700,color:"#fff",marginBottom:10}}>🎣 今おすすめの狙い</div>
+        <div style={{fontSize:16,fontWeight:700,color:"#fff",marginBottom:4}}>🎣 今おすすめの狙い</div>
+        {updateStatus&&(
+          <div style={{fontSize:11,marginBottom:10,
+            color:updateStatus.level==="alert"?"#e84c3d":"#6a9bb8"}}>
+            {updateStatus.text}
+          </div>
+        )}
+        {reportsMalformed&&(
+          <div style={{fontSize:11,color:"#e84c3d",marginBottom:10}}>
+            ⚠️ 最新釣果情報の形式に問題があります（一部のデータのみ表示しています）
+          </div>
+        )}
         {recommendations.length===0?(
           <div style={{fontSize:12,color:"#6a9bb8",lineHeight:1.7,marginBottom:14}}>
             {reportsError?"最新釣果情報を取得できませんでした。自分の実績が増えると、ここに傾向が表示されます。"
@@ -2148,6 +2187,8 @@ function App(){
   });
   const [externalReports,setExternalReports]=useState([]);
   const [reportsError,setReportsError]=useState(false);
+  const [reportsMalformed,setReportsMalformed]=useState(false);
+  const [reportsUpdatedAt,setReportsUpdatedAt]=useState(null);
 
   useEffect(()=>{
     let cancelled=false;
@@ -2155,7 +2196,12 @@ function App(){
       if(!res.ok) throw new Error("fetch failed");
       return res.json();
     }).then(data=>{
-      if(!cancelled) setExternalReports(Array.isArray(data.reports)?data.reports:[]);
+      if(cancelled) return;
+      const sanitized=sanitizeReportsPayload(data);
+      if(sanitized===null){ setExternalReports([]); setReportsMalformed(true); return; }
+      setExternalReports(sanitized.reports);
+      setReportsUpdatedAt(sanitized.updatedAt);
+      if(sanitized.malformedCount>0) setReportsMalformed(true);
     }).catch(()=>{
       if(!cancelled){ setExternalReports([]); setReportsError(true); }
     });
@@ -2276,6 +2322,7 @@ function App(){
           {tab==="spots"&&<SpotsTab onStartFishing={handleStartFishing}/>}
           {tab==="today"&&<TodayFishingView activeSession={activeSession} catches={catches} fishMaster={fishMaster}
             recommendations={recommendations} reports={externalReports} reportsError={reportsError}
+            reportsMalformed={reportsMalformed} reportsUpdatedAt={reportsUpdatedAt}
             onSwitchToSpots={()=>setTab("spots")}
             onLogEvent={handleLogEvent} onLogCatch={handleLogCatch} onUpdateCatch={handleUpdateCatch}
             onEndSession={handleEndSession}

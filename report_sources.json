@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "sources": [
+    {
+      "id": "joshuya-numazu",
+      "name": "つり具の上州屋 新沼津店",
+      "url": "https://www.johshuya.co.jp/shop/choka.php?s=77",
+      "defaultFishingType": "shore",
+      "area": "沼津周辺",
+      "enabled": true,
+      "note": "岸釣り・船釣り両方の釣果情報を掲載。fishingTypeは記事ごとに要確認。"
+    },
+    {
+      "id": "taishi-numazu",
+      "name": "釣具・釣餌タイシ",
+      "url": "https://fishing-taishi.com/",
+      "defaultFishingType": "shore",
+      "area": "沼津湾内堤防",
+      "enabled": true,
+      "note": "沼津湾内堤防の釣果情報が中心。"
+    },
+    {
+      "id": "arakawaya",
+      "name": "荒川屋",
+      "url": "https://arakawaya.jp/catch",
+      "defaultFishingType": "boat",
+      "area": "沼津沖",
+      "enabled": true,
+      "note": "シロギス・LTアジ・タチウオ等の乗合船釣果情報。"
+    },
+    {
+      "id": "koshomaru-shizuura",
+      "name": "第八幸松丸",
+      "url": "https://numazu-koshomaru.com/category/result/",
+      "defaultFishingType": "boat",
+      "area": "静浦",
+      "enabled": true,
+      "note": "静浦港発の乗合船。ロックフィッシュ・イカ・タチウオ等。"
+    },
+    {
+      "id": "ishiguro-numazu",
+      "name": "釣具のイシグロ（沼津・伊豆エリア釣行レポート）",
+      "url": "https://www.ishiguro-gr.com/enjoy/fishing/",
+      "defaultFishingType": "unknown",
+      "area": "沼津周辺",
+      "enabled": true,
+      "note": "投稿日が古いレポートが多いため、日付を必ず個別に確認すること。"
+    }
+  ]
+}
